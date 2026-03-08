@@ -67,18 +67,25 @@ export async function getIssue(issueId: string): Promise<LinearIssue> {
 export async function getIssueByIdentifier(identifier: string): Promise<LinearIssue> {
   const [teamKey, numberStr] = identifier.split('-');
   const number = parseInt(numberStr, 10);
+  const { teamId } = getConfig();
   const data = await linearQuery(`
-    query GetIssueByNumber($teamKey: String!, $number: Float!) {
-      issueByIdentifier(teamKey: $teamKey, number: $number) {
-        id identifier title description priority url createdAt updatedAt
-        state { id name type }
-        assignee { id name email }
-        labels { nodes { id name } }
-        comments { nodes { id body createdAt user { name } } }
+    query SearchIssue($teamId: String!, $number: Float!) {
+      team(id: $teamId) {
+        issues(filter: { number: { eq: $number } }, first: 1) {
+          nodes {
+            id identifier title description priority url createdAt updatedAt
+            state { id name type }
+            assignee { id name email }
+            labels { nodes { id name } }
+            comments { nodes { id body createdAt user { name } } }
+          }
+        }
       }
     }
-  `, { teamKey, number });
-  return data.issueByIdentifier;
+  `, { teamId, number });
+  const issues = data.team.issues.nodes;
+  if (!issues || issues.length === 0) throw new Error(`Issue ${identifier} not found`);
+  return issues[0];
 }
 
 // ============ Issue Mutations ============
