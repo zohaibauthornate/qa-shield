@@ -26,10 +26,34 @@ export async function POST(req: NextRequest) {
     // 2. Build AI prompt and get enrichment
     const prompt = buildEnrichmentPrompt(issue);
 
-    // Call OpenAI (or any LLM)
+    // Call AI (Anthropic Claude or OpenAI)
     let enrichment: TicketEnrichment;
 
-    if (process.env.OPENAI_API_KEY) {
+    if (process.env.ANTHROPIC_API_KEY) {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 4096,
+          temperature: 0.3,
+          system: 'You are QA Shield, an expert QA analyst for a Web3 trading platform. Respond ONLY with valid JSON. No markdown, no explanation, just the JSON object.',
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      });
+
+      const aiResponse = await res.json();
+      if (aiResponse.error) throw new Error(aiResponse.error.message);
+
+      const content = aiResponse.content?.[0]?.text || '{}';
+      // Extract JSON from potential markdown code blocks
+      const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, content];
+      enrichment = JSON.parse(jsonMatch[1].trim());
+    } else if (process.env.OPENAI_API_KEY) {
       const { default: OpenAI } = await import('openai');
       const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
