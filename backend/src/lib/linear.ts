@@ -135,6 +135,39 @@ export async function addLabel(issueId: string, labelIds: string[]): Promise<boo
   return data.issueUpdate.success;
 }
 
+export async function createIssue(input: {
+  title: string;
+  description: string;
+  priority?: number;
+  labelIds?: string[];
+  stateId?: string;
+  assigneeId?: string;
+}): Promise<{ identifier: string; title: string; url: string; id: string }> {
+  const { teamId } = getConfig();
+  const data = await linearQuery(`
+    mutation CreateIssue($input: IssueCreateInput!) {
+      issueCreate(input: $input) {
+        success
+        issue {
+          id identifier title url
+        }
+      }
+    }
+  `, {
+    input: {
+      teamId,
+      title: input.title,
+      description: input.description,
+      priority: input.priority || 0,
+      labelIds: input.labelIds || [],
+      stateId: input.stateId || WORKFLOW_STATES.TODO,
+    },
+  });
+
+  if (!data.issueCreate.success) throw new Error('Failed to create issue');
+  return data.issueCreate.issue;
+}
+
 // ============ Team Queries ============
 
 export async function getTeamIssues(stateFilter?: string, limit = 50) {

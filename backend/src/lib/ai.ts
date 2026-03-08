@@ -223,6 +223,142 @@ For financial logic: flag as critical, include precision and rounding edge cases
 `;
 }
 
+// ============ Verification Report Types ============
+
+export interface VerificationReport {
+  overallVerdict: 'pass' | 'fail' | 'partial';
+  verdictSummary: string;
+  stepsExecuted: {
+    name: string;
+    status: 'pass' | 'fail' | 'skip' | 'warn';
+    details: string;
+  }[];
+  passed: string[];
+  failed: {
+    test: string;
+    reason: string;
+  }[];
+  notTestReady: {
+    area: string;
+    reason: string;
+  }[];
+  cannotTest: {
+    area: string;
+    constraint: string;
+  }[];
+  newIssuesFound: {
+    title: string;
+    description: string;
+    severity: 'critical' | 'high' | 'medium' | 'low';
+    priority: 'urgent' | 'high' | 'medium' | 'low';
+    stepsToReproduce?: string[];
+    labels: string[];
+  }[];
+}
+
+// ============ Verification Prompt ============
+
+export function buildVerificationPrompt(
+  issue: LinearIssue,
+  enrichment: TicketEnrichment | null,
+  securityResults: any[],
+  benchmark: { ours: any; axiom: any; pump: any }
+): string {
+  const testCases = enrichment?.testCases?.map(tc =>
+    `${tc.id}: ${tc.title} [${tc.priority}]\nSteps: ${tc.steps.join(' → ')}\nExpected: ${tc.expected}`
+  ).join('\n\n') || 'No test cases available';
+
+  const secFailures = securityResults
+    .filter(r => r.overallStatus !== 'pass')
+    .map(r => {
+      const ep = r.endpoint.split('/api')[1] || r.endpoint;
+      const issues = r.checks.filter((c: any) => c.status !== 'pass')
+        .map((c: any) => `[${c.type}] ${c.details}`).join('; ');
+      return `/api${ep}: ${issues}`;
+    }).join('\n');
+
+  return `${PLATFORM_CONTEXT}
+
+You are verifying a fix for the following Linear ticket. Analyze the ticket, the test cases, the security scan results, and the performance benchmark data to produce a comprehensive verification report.
+
+TICKET: ${issue.identifier}
+TITLE: ${issue.title}
+DESCRIPTION:
+${issue.description || 'No description'}
+
+STATE: ${issue.state.name}
+ASSIGNEE: ${issue.assignee?.name || 'Unassigned'}
+
+EXISTING COMMENTS:
+${issue.comments.nodes.map(c => `[${c.user.name}]: ${c.body}`).join('\n') || 'None'}
+
+TEST CASES TO VERIFY:
+${testCases}
+
+SECURITY SCAN RESULTS:
+${secFailures || 'All endpoints passed'}
+
+PERFORMANCE BENCHMARK:
+- creator.fun: ${benchmark.ours.responseTime}ms (TTFB: ${benchmark.ours.ttfb}ms)
+- axiom.trade: ${benchmark.axiom.responseTime}ms (TTFB: ${benchmark.axiom.ttfb}ms)
+- pump.fun: ${benchmark.pump.responseTime}ms (TTFB: ${benchmark.pump.ttfb}ms)
+
+Respond with a JSON object matching this EXACT structure:
+{
+  "overallVerdict": "pass|fail|partial",
+  "verdictSummary": "Brief summary of the verification result",
+  "stepsExecuted": [
+    {
+      "name": "Step name (e.g., 'Verify CORS fix', 'Check auth on /api/watchlist')",
+      "status": "pass|fail|skip|warn",
+      "details": "What was checked and what happened"
+    }
+  ],
+  "passed": ["List of things that passed verification"],
+  "failed": [
+    {
+      "test": "What failed",
+      "reason": "Why it failed and what the actual behavior was"
+    }
+  ],
+  "notTestReady": [
+    {
+      "area": "Feature/component that isn't ready for testing",
+      "reason": "Why it's not ready (e.g., 'Feature not yet deployed to staging', 'API endpoint returns 404')"
+    }
+  ],
+  "cannotTest": [
+    {
+      "area": "Feature/component that can't be tested",
+      "constraint": "The constraint preventing testing (e.g., 'Requires funded wallet on devnet', 'Needs specific user role', 'Requires WebSocket connection monitoring tool')"
+    }
+  ],
+  "newIssuesFound": [
+    {
+      "title": "[Type][Severity] Short descriptive title",
+      "description": "Detailed description of the new issue found during verification",
+      "severity": "critical|high|medium|low",
+      "priority": "urgent|high|medium|low",
+      "stepsToReproduce": ["Step 1", "Step 2"],
+      "labels": ["label-id-1"]
+    }
+  ]
+}
+
+IMPORTANT RULES:
+- Be thorough. Go through each test case and determine if it can be verified based on available data.
+- If a security scan found issues, those should appear in "failed" AND be created as "newIssuesFound" with proper Linear tickets.
+- Performance degradation vs competitors should be flagged.
+- If you can't verify something due to needing a wallet, specific user account, browser interaction, etc., put it in "cannotTest".
+- If the fix hasn't been deployed yet or endpoints aren't responding, put those in "notTestReady".
+- For newIssuesFound labels, use these IDs:
+  - Bug: dc54ea90-03f6-48e7-baae-15306da57a56
+  - Frontend: f09ae1f9-f0dc-4229-9958-4929296416ce
+  - Backend: fcefe1f0-859f-4076-b6ab-10ae1b42c1b9
+- Every new issue MUST have a clear title, description, and steps to reproduce.
+`;
+}
+
 // ============ Format as Linear Comment ============
 
 export function formatEnrichmentAsComment(enrichment: TicketEnrichment): string {
