@@ -82,50 +82,33 @@ async function verifyFix() {
   const identifier = getIssueIdentifier();
   if (!identifier) return showError('Could not detect ticket ID');
 
-  showLoading('Running verification checks...');
+  showLoading('Running full verification (security + benchmark)...\nResults will be posted to Linear.');
 
   try {
-    // First enrich to get test cases, then verify
-    const enrichRes = await fetch(`${QA_SHIELD_API}/api/enrich`, {
+    const res = await fetch(`${QA_SHIELD_API}/api/verify`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier, postComment: false }),
+      body: JSON.stringify({ identifier, postComment: true }),
     });
 
-    const enrichData = await enrichRes.json();
-    if (!enrichData.success) throw new Error(enrichData.error);
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error);
 
-    // Run security checks from enrichment
-    const secRes = await fetch(`${QA_SHIELD_API}/api/security/scan`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        endpoints: enrichData.enrichment.scope.affectedEndpoints
-          .filter(e => e !== 'Requires investigation')
-          .map(e => e.startsWith('/') ? e : `/${e}`),
-      }),
-    });
-
-    const secData = await secRes.json();
-
-    // Run benchmark
-    const benchRes = await fetch(`${QA_SHIELD_API}/api/monitor/health?mode=benchmark`);
-    const benchData = await benchRes.json();
-
-    showVerificationResults(enrichData.enrichment, secData, benchData);
+    showVerificationResults(data.security, data.benchmark, data.commentPosted);
   } catch (err) {
     showError(`Verification failed: ${err.message}`);
   }
 }
 
 async function runSecurityScan() {
-  showLoading('Running security scan...');
+  const identifier = getIssueIdentifier();
+  showLoading('Running security scan...\nResults will be posted to Linear.');
 
   try {
     const res = await fetch(`${QA_SHIELD_API}/api/security/scan`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
+      body: JSON.stringify({ identifier, postComment: true }),
     });
 
     const data = await res.json();
@@ -138,15 +121,27 @@ async function runSecurityScan() {
 }
 
 async function runBenchmark() {
-  showLoading('Running performance benchmark against competitors...');
+  const identifier = getIssueIdentifier();
+  showLoading('Running performance benchmark against competitors...\nResults will be posted to Linear.');
 
   try {
-    const res = await fetch(`${QA_SHIELD_API}/api/monitor/health?mode=benchmark`);
-    const data = await res.json();
+    const res = await fetch(`${QA_SHIELD_API}/api/monitor/health?mode=benchmark`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ identifier, postComment: true }),
+    });
 
+    const data = await res.json();
     showBenchmarkResults(data);
   } catch (err) {
-    showError(`Benchmark failed: ${err.message}`);
+    // Fallback to GET if POST not supported
+    try {
+      const res = await fetch(`${QA_SHIELD_API}/api/monitor/health?mode=benchmark`);
+      const data = await res.json();
+      showBenchmarkResults(data);
+    } catch (err2) {
+      showError(`Benchmark failed: ${err2.message}`);
+    }
   }
 }
 
@@ -235,7 +230,7 @@ function showEnrichmentResults(enrichment, commentPosted) {
   `;
 }
 
-function showVerificationResults(enrichment, security, benchmark) {
+function showVerificationResults(security, benchmark, commentPosted) {
   const loading = document.getElementById('qs-loading');
   const results = document.getElementById('qs-results');
   loading.style.display = 'none';
