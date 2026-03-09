@@ -1,6 +1,6 @@
 /**
- * AI Enrichment Engine for QA Shield
- * Analyzes Linear tickets and generates comprehensive QA context
+ * AI Enrichment & Verification Engine for QA Shield v0.2
+ * Precision analysis — investigate, classify, scope, test, verify
  */
 
 import type { LinearIssue } from './linear';
@@ -8,36 +8,40 @@ import type { LinearIssue } from './linear';
 // ============ Types ============
 
 export interface TicketEnrichment {
-  issueType: 'ui' | 'backend' | 'api' | 'onchain' | 'mixed';
-  priorityRecommendation: {
-    level: 'urgent' | 'high' | 'medium' | 'low';
-    score: number; // 1-4
+  classification: {
+    type: 'bug' | 'improvement' | 'feature' | 'refactor' | 'hotfix';
     reasoning: string;
   };
-  rootCause: {
+  whatWentWrong: {
     summary: string;
-    causedBy: string; // component/module that caused the issue
-    category: string; // logic error, missing validation, race condition, etc.
-  };
-  scope: {
-    summary: string;
-    affectedPages: string[];
-    affectedComponents: string[];
-    affectedEndpoints: string[];
+    rootCause: string;
+    component: string;
+    category: string; // logic error, missing validation, race condition, UI inconsistency, etc.
   };
   impact: {
     severity: 'critical' | 'high' | 'medium' | 'low';
-    userFacing: boolean;
+    scope: string;
+    affectedUsers: string;
+    affectedPages: string[];
+    affectedEndpoints: string[];
     financialImpact: boolean;
     securityImpact: boolean;
-    description: string;
+  };
+  stepsToReproduce: string[];
+  expectedBehavior: string;
+  actualBehavior: string;
+  recommendedFix: {
+    approach: string;
+    filesLikelyInvolved: string[];
+    estimatedEffort: 'small' | 'medium' | 'large';
   };
   testCases: TestCase[];
   edgeCases: EdgeCase[];
-  impactedAreas: ImpactedArea[];
-  responsiveness: ResponsivenessCheck[];
-  securityChecks: SecurityCheck[];
-  performanceBenchmarks: PerformanceBenchmark[];
+  postFixVerification: string[];
+  priorityRecommendation: {
+    level: 'urgent' | 'high' | 'medium' | 'low';
+    reasoning: string;
+  };
 }
 
 export interface TestCase {
@@ -55,205 +59,152 @@ export interface EdgeCase {
   howToTest: string;
 }
 
-export interface ImpactedArea {
-  page: string;
-  component: string;
-  reason: string;
-  checkRequired: boolean;
-}
-
-export interface ResponsivenessCheck {
-  breakpoint: string;
-  viewport: string;
-  elementsToCheck: string[];
-}
-
-export interface SecurityCheck {
-  endpoint: string;
-  checkType: 'auth' | 'cors' | 'data-exposure' | 'injection' | 'rate-limit';
-  description: string;
-  severity: 'critical' | 'high' | 'medium' | 'low';
-}
-
-export interface PerformanceBenchmark {
-  metric: string;
-  ourValue?: number;
-  competitorValue?: number;
-  competitor: string;
-  status: 'faster' | 'slower' | 'similar' | 'untested';
-  threshold: string;
+export interface VerificationReport {
+  overallVerdict: 'pass' | 'fail' | 'partial';
+  verdictSummary: string;
+  fixVerification: {
+    status: 'pass' | 'fail' | 'partial' | 'cannot_verify';
+    summary: string;
+    stepsExecuted: {
+      name: string;
+      status: 'pass' | 'fail' | 'skip' | 'warn';
+      details: string;
+    }[];
+    passed: string[];
+    failed: { test: string; reason: string }[];
+    cannotTest: { area: string; constraint: string }[];
+  };
+  sanityChecks: {
+    status: 'pass' | 'fail' | 'partial';
+    checks: { name: string; status: 'pass' | 'fail' | 'warn'; details: string }[];
+  };
+  regressionRisk: {
+    level: 'low' | 'medium' | 'high';
+    areas: string[];
+    recommendation: string;
+  };
+  stressTestNotes: string[];
+  recommendations: string[];
 }
 
 // ============ Platform Context ============
 
 const PLATFORM_CONTEXT = `
-You are QA Shield, an AI QA analyst for Creator.fun — a Solana-based meme coin creation & trading platform (similar to pump.fun / axiom.trade).
+You are QA Shield, a senior QA automation engineer analyzing tickets for Creator.fun — a Solana-based meme coin creation & trading platform (like pump.fun / axiom.trade).
 
 Platform Components:
-- Web App: coin creation, trading, dashboards, charts, liquidity pools
-- Wallet Extension: portfolio management, swap functionality, chat
-- Chat System: DMs and coin-based chatrooms
+- Web App: coin creation, trading, dashboards, charts, liquidity pools, leaderboards
+- Wallet Extension: portfolio management, swap functionality
+- Chat System: DMs and coin-based chatrooms with online presence
 - Backend APIs: token data, trades, analytics, wallet interactions
 - Real-time Systems: WebSocket events, live market updates, price feeds
 
-Key Financial Flows (HIGH RISK):
+Key Financial Flows (HIGH RISK — precision matters):
 - Token creation & bonding curve pricing
 - Buy/sell transactions with SOL
 - PnL calculations, market cap, liquidity
 - Fee claims and rewards distribution
 - Holder tracking and leaderboard rankings
 
-Tech Stack:
-- Frontend: Next.js, React, TypeScript, TailwindCSS
-- Backend: Node.js APIs
-- Blockchain: Solana (devnet for staging)
-- Real-time: WebSocket connections
-
-Competitors to benchmark against:
-- axiom.trade — trading interface, speed, UX
-- pump.fun — coin creation flow, simplicity
+Tech Stack: Next.js + React + TypeScript + TailwindCSS frontend, Node.js APIs, Solana devnet
+Staging: https://dev.creator.fun (frontend), https://dev.bep.creator.fun (API)
 `;
 
-// ============ Enrichment Engine ============
+// ============ Enrichment Prompt ============
 
 export function buildEnrichmentPrompt(issue: LinearIssue): string {
   const labels = issue.labels.nodes.map(l => l.name).join(', ');
   const existingComments = issue.comments.nodes
-    .map(c => `[${c.user.name}]: ${c.body}`)
+    .map(c => `[${c.user.name}]: ${c.body.substring(0, 300)}`)
     .join('\n');
 
   return `${PLATFORM_CONTEXT}
 
-Analyze this Linear ticket and produce a comprehensive QA enrichment report.
+Analyze this Linear ticket and produce a precise, actionable QA analysis. Think like a senior QA engineer investigating an issue on the staging environment.
 
 TICKET: ${issue.identifier}
 TITLE: ${issue.title}
 DESCRIPTION:
 ${issue.description || 'No description provided'}
 
-CURRENT LABELS: ${labels || 'None'}
-CURRENT PRIORITY: ${issue.priority} (0=none, 1=urgent, 2=high, 3=medium, 4=low)
+LABELS: ${labels || 'None'}
+PRIORITY: ${issue.priority} (0=none, 1=urgent, 2=high, 3=medium, 4=low)
 ASSIGNEE: ${issue.assignee?.name || 'Unassigned'}
 STATE: ${issue.state.name}
 
 EXISTING COMMENTS:
 ${existingComments || 'None'}
 
-Respond with a JSON object matching this exact structure:
+Produce a JSON object with this EXACT structure:
 {
-  "issueType": "ui|backend|api|onchain|mixed",
-  "priorityRecommendation": {
-    "level": "urgent|high|medium|low",
-    "score": 1-4,
-    "reasoning": "why this priority"
+  "classification": {
+    "type": "bug|improvement|feature|refactor|hotfix",
+    "reasoning": "Why this is classified as bug/improvement/etc — be specific"
   },
-  "rootCause": {
-    "summary": "what's wrong",
-    "causedBy": "which component/module",
-    "category": "logic error|missing validation|race condition|ui inconsistency|etc"
-  },
-  "scope": {
-    "summary": "scope description",
-    "affectedPages": ["list of affected pages/routes"],
-    "affectedComponents": ["list of React components likely affected"],
-    "affectedEndpoints": ["list of API endpoints involved"]
+  "whatWentWrong": {
+    "summary": "Clear 1-2 sentence explanation of the problem",
+    "rootCause": "Technical root cause — what in the code/system is causing this",
+    "component": "Which component/module is responsible",
+    "category": "logic error|missing validation|race condition|UI inconsistency|missing feature|performance|data mismatch|etc"
   },
   "impact": {
     "severity": "critical|high|medium|low",
-    "userFacing": true/false,
+    "scope": "How widespread is this? (e.g. 'All users on token detail page', 'Only affects new coin creation')",
+    "affectedUsers": "Who is affected (e.g. 'All users', 'Token creators only', 'Users with holdings')",
+    "affectedPages": ["/page/routes"],
+    "affectedEndpoints": ["/api/endpoints"],
     "financialImpact": true/false,
-    "securityImpact": true/false,
-    "description": "impact description"
+    "securityImpact": true/false
+  },
+  "stepsToReproduce": [
+    "1. Navigate to https://dev.creator.fun/...",
+    "2. Click on ...",
+    "3. Observe that ..."
+  ],
+  "expectedBehavior": "What should happen",
+  "actualBehavior": "What actually happens",
+  "recommendedFix": {
+    "approach": "How the dev should approach fixing this",
+    "filesLikelyInvolved": ["src/components/...", "src/api/..."],
+    "estimatedEffort": "small|medium|large"
   },
   "testCases": [
     {
       "id": "TC-1",
-      "title": "test case title",
-      "steps": ["step 1", "step 2"],
-      "expected": "expected result",
+      "title": "Verify the primary fix",
+      "steps": ["Step 1", "Step 2"],
+      "expected": "Expected result with clear pass/fail criteria",
       "priority": "must|should|nice"
     }
   ],
   "edgeCases": [
     {
       "id": "EC-1",
-      "scenario": "edge case description",
+      "scenario": "Edge case description",
       "risk": "high|medium|low",
-      "howToTest": "how to reproduce"
+      "howToTest": "How to reproduce this edge case"
     }
   ],
-  "impactedAreas": [
-    {
-      "page": "page name",
-      "component": "component name",
-      "reason": "why this area might be affected",
-      "checkRequired": true/false
-    }
+  "postFixVerification": [
+    "After the fix lands, verify: ...",
+    "Check regression in: ...",
+    "Confirm no side effects on: ..."
   ],
-  "responsiveness": [
-    {
-      "breakpoint": "mobile|tablet|desktop",
-      "viewport": "375x667|768x1024|1920x1080",
-      "elementsToCheck": ["element 1", "element 2"]
-    }
-  ],
-  "securityChecks": [
-    {
-      "endpoint": "/api/xxx",
-      "checkType": "auth|cors|data-exposure|injection|rate-limit",
-      "description": "what to check",
-      "severity": "critical|high|medium|low"
-    }
-  ],
-  "performanceBenchmarks": [
-    {
-      "metric": "page load time|api response|ttfb|etc",
-      "competitor": "axiom.trade|pump.fun",
-      "status": "untested",
-      "threshold": "should be under Xms"
-    }
-  ]
+  "priorityRecommendation": {
+    "level": "urgent|high|medium|low",
+    "reasoning": "Why this priority level"
+  }
 }
 
-Be thorough. Think like a senior QA engineer who knows this platform inside out.
-Generate at least 3-5 test cases, 2-3 edge cases, and check all relevant security concerns.
-For UI changes: always include responsiveness checks for mobile (375px), tablet (768px), and desktop (1920px).
-For API changes: always include auth, CORS, and rate-limit security checks.
-For financial logic: flag as critical, include precision and rounding edge cases.
+RULES:
+- Be PRECISE. Don't give generic advice. Reference specific pages, components, endpoints from the ticket.
+- Steps to reproduce should be exact — a QA engineer should be able to follow them on dev.creator.fun.
+- Generate 3-5 test cases minimum, 2-3 edge cases.
+- For UI bugs: reference specific CSS properties, component names, breakpoints.
+- For API bugs: reference specific endpoints, request/response shapes.
+- For financial logic: flag as critical, include precision and rounding edge cases.
+- Classification matters: a "bug" is broken existing functionality. An "improvement" is enhancing existing functionality. A "feature" is new functionality.
 `;
-}
-
-// ============ Verification Report Types ============
-
-export interface VerificationReport {
-  overallVerdict: 'pass' | 'fail' | 'partial';
-  verdictSummary: string;
-  stepsExecuted: {
-    name: string;
-    status: 'pass' | 'fail' | 'skip' | 'warn';
-    details: string;
-  }[];
-  passed: string[];
-  failed: {
-    test: string;
-    reason: string;
-  }[];
-  notTestReady: {
-    area: string;
-    reason: string;
-  }[];
-  cannotTest: {
-    area: string;
-    constraint: string;
-  }[];
-  newIssuesFound: {
-    title: string;
-    description: string;
-    severity: 'critical' | 'high' | 'medium' | 'low';
-    priority: 'urgent' | 'high' | 'medium' | 'low';
-    stepsToReproduce?: string[];
-    labels: string[];
-  }[];
 }
 
 // ============ Verification Prompt ============
@@ -266,7 +217,7 @@ export function buildVerificationPrompt(
 ): string {
   const testCases = enrichment?.testCases?.map(tc =>
     `${tc.id}: ${tc.title} [${tc.priority}]\nSteps: ${tc.steps.join(' → ')}\nExpected: ${tc.expected}`
-  ).join('\n\n') || 'No test cases available';
+  ).join('\n\n') || 'No test cases generated';
 
   const secFailures = securityResults
     .filter(r => r.overallStatus !== 'pass')
@@ -279,7 +230,7 @@ export function buildVerificationPrompt(
 
   return `${PLATFORM_CONTEXT}
 
-You are verifying a fix for the following Linear ticket. Analyze the ticket, the test cases, the security scan results, and the performance benchmark data to produce a comprehensive verification report.
+You are verifying whether the fix for this ticket ACTUALLY resolves the reported issue. Focus ONLY on whether the fix works — NOT on unrelated security or performance findings.
 
 TICKET: ${issue.identifier}
 TITLE: ${issue.title}
@@ -290,169 +241,289 @@ STATE: ${issue.state.name}
 ASSIGNEE: ${issue.assignee?.name || 'Unassigned'}
 
 EXISTING COMMENTS:
-${issue.comments.nodes.map(c => `[${c.user.name}]: ${c.body}`).join('\n') || 'None'}
+${issue.comments.nodes.map(c => `[${c.user.name}]: ${c.body.substring(0, 300)}`).join('\n') || 'None'}
 
 TEST CASES TO VERIFY:
 ${testCases}
 
-SECURITY SCAN RESULTS:
+SECURITY SCAN DATA (for separate report — do NOT use this to fail the ticket):
 ${secFailures || 'All endpoints passed'}
 
-PERFORMANCE BENCHMARK:
-- creator.fun: ${benchmark.ours.responseTime}ms (TTFB: ${benchmark.ours.ttfb}ms)
-- axiom.trade: ${benchmark.axiom.responseTime}ms (TTFB: ${benchmark.axiom.ttfb}ms)
-- pump.fun: ${benchmark.pump.responseTime}ms (TTFB: ${benchmark.pump.ttfb}ms)
+PERFORMANCE DATA (for separate report — do NOT use this to fail the ticket):
+- creator.fun: ${benchmark.ours?.responseTime ?? 'N/A'}ms (TTFB: ${benchmark.ours?.ttfb ?? 'N/A'}ms)
+- axiom.trade: ${benchmark.axiom?.responseTime ?? 'N/A'}ms (TTFB: ${benchmark.axiom?.ttfb ?? 'N/A'}ms)
+- pump.fun: ${benchmark.pump?.responseTime ?? 'N/A'}ms (TTFB: ${benchmark.pump?.ttfb ?? 'N/A'}ms)
 
-Respond with a JSON object matching this EXACT structure:
+Produce a JSON object with this EXACT structure:
 {
   "overallVerdict": "pass|fail|partial",
-  "verdictSummary": "Brief summary of the verification result",
-  "stepsExecuted": [
-    {
-      "name": "Step name (e.g., 'Verify CORS fix', 'Check auth on /api/watchlist')",
-      "status": "pass|fail|skip|warn",
-      "details": "What was checked and what happened"
-    }
+  "verdictSummary": "1-2 sentence summary of the verification result — focused on whether THE FIX works",
+  "fixVerification": {
+    "status": "pass|fail|partial|cannot_verify",
+    "summary": "Summary of what was verified about the fix itself",
+    "stepsExecuted": [
+      {
+        "name": "What was checked",
+        "status": "pass|fail|skip|warn",
+        "details": "Evidence of what was found"
+      }
+    ],
+    "passed": ["List of things that PASSED verification"],
+    "failed": [
+      {
+        "test": "What failed",
+        "reason": "Why it failed — actual vs expected"
+      }
+    ],
+    "cannotTest": [
+      {
+        "area": "What couldn't be tested",
+        "constraint": "Why (e.g., needs wallet, specific account, browser interaction)"
+      }
+    ]
+  },
+  "sanityChecks": {
+    "status": "pass|fail|partial",
+    "checks": [
+      {
+        "name": "Sanity check name (e.g., 'Page loads without errors', 'No console errors')",
+        "status": "pass|fail|warn",
+        "details": "What was found"
+      }
+    ]
+  },
+  "regressionRisk": {
+    "level": "low|medium|high",
+    "areas": ["Areas that might be affected by this change"],
+    "recommendation": "What to watch for"
+  },
+  "stressTestNotes": [
+    "Stress/load testing suggestions for this specific fix (not generic)"
   ],
-  "passed": ["List of things that passed verification"],
-  "failed": [
-    {
-      "test": "What failed",
-      "reason": "Why it failed and what the actual behavior was"
-    }
-  ],
-  "notTestReady": [
-    {
-      "area": "Feature/component that isn't ready for testing",
-      "reason": "Why it's not ready (e.g., 'Feature not yet deployed to staging', 'API endpoint returns 404')"
-    }
-  ],
-  "cannotTest": [
-    {
-      "area": "Feature/component that can't be tested",
-      "constraint": "The constraint preventing testing (e.g., 'Requires funded wallet on devnet', 'Needs specific user role', 'Requires WebSocket connection monitoring tool')"
-    }
-  ],
-  "newIssuesFound": [
-    {
-      "title": "[Type][Severity] Short descriptive title",
-      "description": "Detailed description of the new issue found during verification",
-      "severity": "critical|high|medium|low",
-      "priority": "urgent|high|medium|low",
-      "stepsToReproduce": ["Step 1", "Step 2"],
-      "labels": ["label-id-1"]
-    }
+  "recommendations": [
+    "Specific recommendations for this ticket"
   ]
 }
 
-IMPORTANT RULES:
-- Be thorough. Go through each test case and determine if it can be verified based on available data.
-- If a security scan found issues, those should appear in "failed" AND be created as "newIssuesFound" with proper Linear tickets.
-- Performance degradation vs competitors should be flagged.
-- If you can't verify something due to needing a wallet, specific user account, browser interaction, etc., put it in "cannotTest".
-- If the fix hasn't been deployed yet or endpoints aren't responding, put those in "notTestReady".
-- For newIssuesFound labels, use these IDs:
-  - Bug: dc54ea90-03f6-48e7-baae-15306da57a56
-  - Frontend: f09ae1f9-f0dc-4229-9958-4929296416ce
-  - Backend: fcefe1f0-859f-4076-b6ab-10ae1b42c1b9
-- Every new issue MUST have a clear title, description, and steps to reproduce.
+CRITICAL RULES:
+- The overallVerdict should ONLY be based on whether THE FIX works, NOT on security or performance side-findings.
+- Security issues are tracked separately — never fail a ticket because of unrelated security concerns.
+- Performance differences are informational — never fail a ticket because we're slower than competitors.
+- Be honest: if you cannot verify the fix without browser interaction, say "cannot_verify" — don't guess.
+- Include specific evidence in your analysis, not generic statements.
 `;
 }
 
-// ============ Format as Linear Comment ============
+// ============ Format: Enrichment Comment ============
 
 export function formatEnrichmentAsComment(enrichment: TicketEnrichment): string {
-  let comment = `## 🛡️ QA Shield — Ticket Enrichment\n\n`;
+  let c = `## 🛡️ QA Shield — Ticket Analysis\n\n`;
 
-  // Classification
-  comment += `### 📋 Classification\n`;
-  comment += `- **Type:** ${enrichment.issueType.toUpperCase()}\n`;
-  comment += `- **Priority:** ${enrichment.priorityRecommendation.level.toUpperCase()} (${enrichment.priorityRecommendation.reasoning})\n`;
-  comment += `- **Severity:** ${enrichment.impact.severity.toUpperCase()}\n`;
-  comment += `- **User-facing:** ${enrichment.impact.userFacing ? '✅ Yes' : '❌ No'}\n`;
-  comment += `- **Financial impact:** ${enrichment.impact.financialImpact ? '⚠️ Yes' : '❌ No'}\n`;
-  comment += `- **Security impact:** ${enrichment.impact.securityImpact ? '🔴 Yes' : '❌ No'}\n\n`;
+  // Classification banner
+  const typeEmoji = enrichment.classification.type === 'bug' ? '🐛' : enrichment.classification.type === 'improvement' ? '✨' : enrichment.classification.type === 'feature' ? '🆕' : '🔧';
+  c += `> ${typeEmoji} **${enrichment.classification.type.toUpperCase()}** — ${enrichment.classification.reasoning}\n\n`;
 
-  // Root Cause
-  comment += `### 🔍 Root Cause\n`;
-  comment += `- **Summary:** ${enrichment.rootCause.summary}\n`;
-  comment += `- **Caused by:** ${enrichment.rootCause.causedBy}\n`;
-  comment += `- **Category:** ${enrichment.rootCause.category}\n\n`;
+  // What Went Wrong
+  c += `### 🔍 What Went Wrong\n\n`;
+  c += `${enrichment.whatWentWrong.summary}\n\n`;
+  c += `- **Root Cause:** ${enrichment.whatWentWrong.rootCause}\n`;
+  c += `- **Component:** \`${enrichment.whatWentWrong.component}\`\n`;
+  c += `- **Category:** ${enrichment.whatWentWrong.category}\n\n`;
 
-  // Scope
-  comment += `### 📐 Scope & Impact\n`;
-  comment += `${enrichment.scope.summary}\n\n`;
-  if (enrichment.scope.affectedPages.length > 0) {
-    comment += `**Affected Pages:**\n`;
-    enrichment.scope.affectedPages.forEach(p => { comment += `- ${p}\n`; });
-    comment += '\n';
+  // Impact & Scope
+  c += `### 📐 Impact & Scope\n\n`;
+  c += `- **Severity:** ${enrichment.impact.severity.toUpperCase()}\n`;
+  c += `- **Scope:** ${enrichment.impact.scope}\n`;
+  c += `- **Affected Users:** ${enrichment.impact.affectedUsers}\n`;
+  if (enrichment.impact.financialImpact) c += `- ⚠️ **Financial Impact:** Yes\n`;
+  if (enrichment.impact.securityImpact) c += `- 🔴 **Security Impact:** Yes\n`;
+  if (enrichment.impact.affectedPages.length > 0) {
+    c += `- **Pages:** ${enrichment.impact.affectedPages.map(p => `\`${p}\``).join(', ')}\n`;
   }
-  if (enrichment.scope.affectedEndpoints.length > 0) {
-    comment += `**Affected Endpoints:**\n`;
-    enrichment.scope.affectedEndpoints.forEach(e => { comment += `- \`${e}\`\n`; });
-    comment += '\n';
+  if (enrichment.impact.affectedEndpoints.length > 0) {
+    c += `- **Endpoints:** ${enrichment.impact.affectedEndpoints.map(e => `\`${e}\``).join(', ')}\n`;
   }
+  c += '\n';
+
+  // Steps to Reproduce
+  c += `### 🔄 Steps to Reproduce\n\n`;
+  enrichment.stepsToReproduce.forEach((s, i) => { c += `${i + 1}. ${s}\n`; });
+  c += `\n**Expected:** ${enrichment.expectedBehavior}\n`;
+  c += `**Actual:** ${enrichment.actualBehavior}\n\n`;
+
+  // Recommended Fix
+  c += `### 🛠️ Recommended Fix\n\n`;
+  c += `${enrichment.recommendedFix.approach}\n\n`;
+  if (enrichment.recommendedFix.filesLikelyInvolved.length > 0) {
+    c += `**Files likely involved:** ${enrichment.recommendedFix.filesLikelyInvolved.map(f => `\`${f}\``).join(', ')}\n`;
+  }
+  c += `**Estimated effort:** ${enrichment.recommendedFix.estimatedEffort}\n\n`;
 
   // Test Cases
-  comment += `### ✅ Test Cases\n\n`;
+  c += `### ✅ Test Cases\n\n`;
   enrichment.testCases.forEach(tc => {
     const badge = tc.priority === 'must' ? '🔴' : tc.priority === 'should' ? '🟡' : '🟢';
-    comment += `**${badge} ${tc.id}: ${tc.title}** [${tc.priority.toUpperCase()}]\n`;
-    tc.steps.forEach((s, i) => { comment += `${i + 1}. ${s}\n`; });
-    comment += `**Expected:** ${tc.expected}\n\n`;
+    c += `**${badge} ${tc.id}: ${tc.title}** [${tc.priority.toUpperCase()}]\n`;
+    tc.steps.forEach((s, i) => { c += `${i + 1}. ${s}\n`; });
+    c += `**Expected:** ${tc.expected}\n\n`;
   });
 
   // Edge Cases
   if (enrichment.edgeCases.length > 0) {
-    comment += `### ⚡ Edge Cases\n\n`;
+    c += `### ⚡ Edge Cases\n\n`;
     enrichment.edgeCases.forEach(ec => {
-      comment += `- **${ec.id}** [${ec.risk.toUpperCase()} risk]: ${ec.scenario}\n  → _How to test:_ ${ec.howToTest}\n`;
+      c += `- **${ec.id}** [${ec.risk.toUpperCase()}]: ${ec.scenario}\n  → _Test:_ ${ec.howToTest}\n`;
     });
-    comment += '\n';
+    c += '\n';
   }
 
-  // Impacted Areas
-  if (enrichment.impactedAreas.length > 0) {
-    comment += `### 🗺️ Impacted Areas (Regression Check)\n\n`;
-    enrichment.impactedAreas.forEach(ia => {
-      const icon = ia.checkRequired ? '⚠️' : 'ℹ️';
-      comment += `- ${icon} **${ia.page}** → \`${ia.component}\`: ${ia.reason}\n`;
-    });
-    comment += '\n';
+  // Post-Fix Verification
+  if (enrichment.postFixVerification.length > 0) {
+    c += `### 🔎 Post-Fix Verification Checklist\n\n`;
+    enrichment.postFixVerification.forEach(item => { c += `- [ ] ${item}\n`; });
+    c += '\n';
   }
 
-  // Responsiveness
-  if (enrichment.responsiveness.length > 0) {
-    comment += `### 📱 Responsiveness Checklist\n\n`;
-    enrichment.responsiveness.forEach(r => {
-      comment += `**${r.breakpoint}** (${r.viewport}):\n`;
-      r.elementsToCheck.forEach(el => { comment += `- [ ] ${el}\n`; });
-      comment += '\n';
+  c += `---\n_Generated by QA Shield 🛡️ — automated ticket analysis_`;
+  return c;
+}
+
+// ============ Format: Fix Verification Comment ============
+
+export function formatFixVerificationComment(
+  issue: { identifier: string; title: string },
+  report: VerificationReport
+): string {
+  const verdictIcon = report.overallVerdict === 'pass' ? '✅' : report.overallVerdict === 'fail' ? '❌' : '⚠️';
+  const verdictText = report.overallVerdict === 'pass' ? 'VERIFICATION PASSED' : report.overallVerdict === 'fail' ? 'VERIFICATION FAILED' : 'PARTIAL VERIFICATION';
+
+  let c = `## ${verdictIcon} ${verdictText}\n\n`;
+  c += `**Ticket:** ${issue.identifier} — ${issue.title}\n`;
+  c += `${report.verdictSummary}\n\n`;
+
+  // Fix Verification Details
+  const fv = report.fixVerification;
+  c += `### 📋 Fix Verification\n\n`;
+
+  if (fv.stepsExecuted.length > 0) {
+    fv.stepsExecuted.forEach(step => {
+      const icon = step.status === 'pass' ? '✅' : step.status === 'fail' ? '❌' : step.status === 'skip' ? '⏭️' : '⚠️';
+      c += `${icon} **${step.name}**\n`;
+      if (step.details) c += `   ${step.details}\n`;
+      c += '\n';
     });
   }
 
-  // Security Checks
-  if (enrichment.securityChecks.length > 0) {
-    comment += `### 🔒 Security Checks\n\n`;
-    enrichment.securityChecks.forEach(sc => {
-      const icon = sc.severity === 'critical' ? '🔴' : sc.severity === 'high' ? '🟠' : '🟡';
-      comment += `- ${icon} **[${sc.checkType.toUpperCase()}]** \`${sc.endpoint}\`: ${sc.description}\n`;
-    });
-    comment += '\n';
+  // What Passed
+  if (fv.passed.length > 0) {
+    c += `**Passed:**\n`;
+    fv.passed.forEach(item => { c += `- ✅ ${item}\n`; });
+    c += '\n';
   }
 
-  // Performance Benchmarks
-  if (enrichment.performanceBenchmarks.length > 0) {
-    comment += `### ⚡ Performance Benchmarks\n\n`;
-    comment += `| Metric | Competitor | Threshold | Status |\n`;
-    comment += `|--------|-----------|-----------|--------|\n`;
-    enrichment.performanceBenchmarks.forEach(pb => {
-      comment += `| ${pb.metric} | ${pb.competitor} | ${pb.threshold} | ${pb.status} |\n`;
+  // What Failed
+  if (fv.failed.length > 0) {
+    c += `**Failed:**\n`;
+    fv.failed.forEach(item => {
+      c += `- ❌ **${item.test}**\n  Reason: ${item.reason}\n`;
     });
-    comment += '\n';
+    c += '\n';
   }
 
-  comment += `---\n_Generated by QA Shield 🛡️ — automated ticket enrichment_`;
+  // Cannot Test
+  if (fv.cannotTest.length > 0) {
+    c += `**Cannot Test:**\n`;
+    fv.cannotTest.forEach(item => {
+      c += `- 🔒 **${item.area}**: ${item.constraint}\n`;
+    });
+    c += '\n';
+  }
 
-  return comment;
+  // Sanity Checks
+  const sc = report.sanityChecks;
+  if (sc.checks.length > 0) {
+    c += `### 🧪 Sanity Checks\n\n`;
+    sc.checks.forEach(check => {
+      const icon = check.status === 'pass' ? '✅' : check.status === 'fail' ? '❌' : '⚠️';
+      c += `${icon} **${check.name}**: ${check.details}\n`;
+    });
+    c += '\n';
+  }
+
+  // Regression Risk
+  c += `### 🎯 Regression Risk: ${report.regressionRisk.level.toUpperCase()}\n\n`;
+  if (report.regressionRisk.areas.length > 0) {
+    c += `Areas to watch: ${report.regressionRisk.areas.join(', ')}\n`;
+  }
+  c += `${report.regressionRisk.recommendation}\n\n`;
+
+  // Recommendations
+  if (report.recommendations.length > 0) {
+    c += `### 💡 Recommendations\n\n`;
+    report.recommendations.forEach(r => { c += `- ${r}\n`; });
+    c += '\n';
+  }
+
+  c += `---\n_Verified by QA Shield 🛡️ at ${new Date().toISOString()}_`;
+  return c;
+}
+
+// ============ Format: Security Assessment Comment ============
+
+export function formatSecurityComment(
+  secSummary: { passed: number; warnings: number; failed: number },
+  securityResults: any[]
+): string {
+  let c = `## 🔒 Security Assessment\n\n`;
+  c += `✅ ${secSummary.passed} passed · ⚠️ ${secSummary.warnings} warnings · ❌ ${secSummary.failed} failed\n\n`;
+
+  const issues = securityResults.filter(r => r.overallStatus !== 'pass');
+  if (issues.length > 0) {
+    for (const r of issues) {
+      const icon = r.overallStatus === 'fail' ? '❌' : '⚠️';
+      const ep = r.endpoint.split('/api')[1] || r.endpoint;
+      c += `${icon} **\`/api${ep}\`**\n`;
+      for (const ch of r.checks) {
+        if (ch.status !== 'pass') {
+          c += `- [${ch.severity.toUpperCase()}] ${ch.details}\n`;
+        }
+      }
+      c += '\n';
+    }
+  } else {
+    c += `All scanned endpoints passed security checks.\n\n`;
+  }
+
+  c += `> ℹ️ Security findings are tracked separately and do not affect ticket verification.\n\n`;
+  c += `---\n_Scanned by QA Shield 🛡️ at ${new Date().toISOString()}_`;
+  return c;
+}
+
+// ============ Format: Performance Assessment Comment ============
+
+export function formatPerformanceComment(
+  benchmark: { ours: any; axiom: any; pump: any }
+): string {
+  let c = `## ⚡ Performance Assessment\n\n`;
+  c += `| Platform | Response Time | TTFB |\n`;
+  c += `|----------|--------------|------|\n`;
+  c += `| **creator.fun** | ${benchmark.ours?.responseTime ?? 'N/A'}ms | ${benchmark.ours?.ttfb ?? 'N/A'}ms |\n`;
+  c += `| axiom.trade | ${benchmark.axiom?.responseTime ?? 'N/A'}ms | ${benchmark.axiom?.ttfb ?? 'N/A'}ms |\n`;
+  c += `| pump.fun | ${benchmark.pump?.responseTime ?? 'N/A'}ms | ${benchmark.pump?.ttfb ?? 'N/A'}ms |\n\n`;
+
+  // Verdict
+  if (benchmark.ours?.responseTime > 0 && benchmark.axiom?.responseTime > 0) {
+    const diff = benchmark.ours.responseTime - benchmark.axiom.responseTime;
+    if (diff > 500) {
+      c += `⚠️ Our frontend is **${Math.round(diff)}ms slower** than axiom.trade. Consider performance optimization.\n\n`;
+    } else if (diff < -200) {
+      c += `✅ Our frontend is **${Math.round(Math.abs(diff))}ms faster** than axiom.trade.\n\n`;
+    } else {
+      c += `✅ Performance is comparable to competitors.\n\n`;
+    }
+  }
+
+  c += `> ℹ️ Performance data is informational and does not affect ticket verification.\n\n`;
+  c += `---\n_Benchmarked by QA Shield 🛡️ at ${new Date().toISOString()}_`;
+  return c;
 }

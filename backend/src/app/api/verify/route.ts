@@ -1,16 +1,24 @@
 /**
  * POST /api/verify
- * Full verification flow:
- * 1. AI analyzes the fix against test cases
- * 2. Runs security scan
- * 3. Runs performance benchmark
- * 4. Posts detailed report to Linear (steps, pass/fail, constraints, not-ready)
- * 5. Creates NEW Linear tickets for any issues found during verification
+ * Full verification flow — acts like a senior QA automation engineer:
+ * 1. AI analyzes the fix against test cases (PASS/FAIL verdict)
+ * 2. Runs security scan (separate assessment)
+ * 3. Runs performance benchmark (separate assessment)
+ * 4. Posts SEPARATE comments on Linear for each aspect
+ * 5. Checks for duplicates before creating any new tickets
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { getIssueByIdentifier, addComment, createIssue, WORKFLOW_STATES, LABELS } from '@/lib/linear';
-import { buildEnrichmentPrompt, buildVerificationPrompt, type TicketEnrichment, type VerificationReport } from '@/lib/ai';
+import { getIssueByIdentifier, addComment, findSimilarIssue, createIssue, LABELS } from '@/lib/linear';
+import {
+  buildEnrichmentPrompt,
+  buildVerificationPrompt,
+  formatFixVerificationComment,
+  formatSecurityComment,
+  formatPerformanceComment,
+  type TicketEnrichment,
+  type VerificationReport,
+} from '@/lib/ai';
 import { scanEndpoint, benchmarkEndpoint } from '@/lib/scanner';
 
 export async function POST(req: NextRequest) {
@@ -26,32 +34,54 @@ export async function POST(req: NextRequest) {
     const stagingApi = process.env.STAGING_API_URL || 'https://dev.bep.creator.fun';
     const stagingUrl = process.env.STAGING_URL || 'https://dev.creator.fun';
 
-    // 1. Get enrichment (test cases) for this ticket
+    // ── Step 1: Get enrichment (test cases) ──
     let enrichment: TicketEnrichment | null = null;
-    if (process.env.ANTHROPIC_API_KEY) {
-      const enrichPrompt = buildEnrichmentPrompt(issue);
-      const enrichRes = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': process.env.ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 4096,
-          temperature: 0.3,
-          system: 'You are QA Shield, an expert QA analyst. Respond ONLY with valid JSON.',
-          messages: [{ role: 'user', content: enrichPrompt }],
-        }),
-      });
-      const enrichData = await enrichRes.json();
-      const content = enrichData.content?.[0]?.text || '{}';
-      const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, content];
-      enrichment = JSON.parse(jsonMatch[1].trim());
+    const aiKey = process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY;
+
+    if (aiKey) {
+      try {
+        const enrichPrompt = buildEnrichmentPrompt(issue);
+
+        if (process.env.ANTHROPIC_API_KEY) {
+          const enrichRes = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': process.env.ANTHROPIC_API_KEY,
+              'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify({
+              model: 'claude-sonnet-4-20250514',
+              max_tokens: 4096,
+              temperature: 0.2,
+              system: 'You are QA Shield, a senior QA automation engineer. Respond ONLY with valid JSON.',
+              messages: [{ role: 'user', content: enrichPrompt }],
+            }),
+          });
+          const enrichData = await enrichRes.json();
+          const content = enrichData.content?.[0]?.text || '{}';
+          const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, content];
+          enrichment = JSON.parse(jsonMatch[1].trim());
+        } else if (process.env.OPENAI_API_KEY) {
+          const { default: OpenAI } = await import('openai');
+          const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+          const completion = await openai.chat.completions.create({
+            model: 'gpt-4o',
+            messages: [
+              { role: 'system', content: 'You are QA Shield, a senior QA automation engineer. Respond ONLY with valid JSON.' },
+              { role: 'user', content: enrichPrompt },
+            ],
+            response_format: { type: 'json_object' },
+            temperature: 0.2,
+          });
+          enrichment = JSON.parse(completion.choices[0].message.content || '{}');
+        }
+      } catch (e) {
+        console.error('Enrichment step failed:', e);
+      }
     }
 
-    // 2. Run security scan
+    // ── Step 2: Security scan ──
     const endpoints = ['/api/token', '/api/watchlist', '/api/user', '/api/chat', '/api/trade', '/api/holdings', '/api/leaderboard'];
     const securityResults = await Promise.all(
       endpoints.map(ep => scanEndpoint(`${stagingApi}${ep}`))
@@ -63,71 +93,118 @@ export async function POST(req: NextRequest) {
       failed: securityResults.filter(r => r.overallStatus === 'fail').length,
     };
 
-    // 3. Run benchmark
+    // ── Step 3: Performance benchmark ──
     const ourPerf = await benchmarkEndpoint(stagingUrl);
     const axiomPerf = await benchmarkEndpoint('https://axiom.trade');
     const pumpPerf = await benchmarkEndpoint('https://pump.fun');
 
-    // 4. AI Verification Analysis
+    // ── Step 4: AI Verification Analysis ──
     let verificationReport: VerificationReport | null = null;
-    if (process.env.ANTHROPIC_API_KEY) {
-      const verifyPrompt = buildVerificationPrompt(issue, enrichment, securityResults, {
+    if (aiKey) {
+      try {
+        const verifyPrompt = buildVerificationPrompt(issue, enrichment, securityResults, {
+          ours: ourPerf,
+          axiom: axiomPerf,
+          pump: pumpPerf,
+        });
+
+        if (process.env.ANTHROPIC_API_KEY) {
+          const verifyRes = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': process.env.ANTHROPIC_API_KEY,
+              'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify({
+              model: 'claude-sonnet-4-20250514',
+              max_tokens: 4096,
+              temperature: 0.2,
+              system: 'You are QA Shield, a senior QA verification analyst. Respond ONLY with valid JSON.',
+              messages: [{ role: 'user', content: verifyPrompt }],
+            }),
+          });
+          const verifyData = await verifyRes.json();
+          const vContent = verifyData.content?.[0]?.text || '{}';
+          const vJsonMatch = vContent.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, vContent];
+          verificationReport = JSON.parse(vJsonMatch[1].trim());
+        } else if (process.env.OPENAI_API_KEY) {
+          const { default: OpenAI } = await import('openai');
+          const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+          const completion = await openai.chat.completions.create({
+            model: 'gpt-4o',
+            messages: [
+              { role: 'system', content: 'You are QA Shield, a senior QA verification analyst. Respond ONLY with valid JSON.' },
+              { role: 'user', content: verifyPrompt },
+            ],
+            response_format: { type: 'json_object' },
+            temperature: 0.2,
+          });
+          verificationReport = JSON.parse(completion.choices[0].message.content || '{}');
+        }
+      } catch (e) {
+        console.error('Verification step failed:', e);
+      }
+    }
+
+    // ── Step 5: Post SEPARATE comments to Linear ──
+    const postedComments: string[] = [];
+
+    if (postComment) {
+      // Comment 1: Fix Verification (the main verdict)
+      if (verificationReport) {
+        const fixComment = formatFixVerificationComment(issue, verificationReport);
+        await addComment(issue.id, fixComment);
+        postedComments.push('fix_verification');
+      }
+
+      // Comment 2: Security Assessment (separate, informational)
+      if (secSummary.failed > 0 || secSummary.warnings > 0) {
+        const secComment = formatSecurityComment(secSummary, securityResults);
+        await addComment(issue.id, secComment);
+        postedComments.push('security_assessment');
+      }
+
+      // Comment 3: Performance Assessment (separate, informational)
+      const perfComment = formatPerformanceComment({
         ours: ourPerf,
         axiom: axiomPerf,
         pump: pumpPerf,
       });
-
-      const verifyRes = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': process.env.ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 4096,
-          temperature: 0.3,
-          system: 'You are QA Shield, an expert QA verification analyst. Respond ONLY with valid JSON.',
-          messages: [{ role: 'user', content: verifyPrompt }],
-        }),
-      });
-      const verifyData = await verifyRes.json();
-      const vContent = verifyData.content?.[0]?.text || '{}';
-      const vJsonMatch = vContent.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, vContent];
-      verificationReport = JSON.parse(vJsonMatch[1].trim());
+      await addComment(issue.id, perfComment);
+      postedComments.push('performance_assessment');
     }
 
-    // 5. Create new Linear tickets for discovered issues
+    // ── Step 6: Create new tickets ONLY if no duplicates exist ──
+    // NOTE: We no longer auto-create security tickets from verification.
+    // Only create tickets for actual NEW bugs found during fix verification.
     const createdTickets: { identifier: string; title: string; url: string }[] = [];
-    if (verificationReport?.newIssuesFound && verificationReport.newIssuesFound.length > 0) {
-      for (const newIssue of verificationReport.newIssuesFound) {
+    const skippedDuplicates: string[] = [];
+
+    // Only look at verification failures that are actual new bugs (not security side-findings)
+    if (verificationReport?.fixVerification.failed && verificationReport.fixVerification.failed.length > 0) {
+      for (const failure of verificationReport.fixVerification.failed) {
+        const title = `[Bug] ${failure.test}`;
+
+        // Check for duplicates first
+        const existing = await findSimilarIssue(title);
+        if (existing) {
+          skippedDuplicates.push(`"${title}" — already tracked as ${existing.identifier}`);
+          continue;
+        }
+
         try {
           const created = await createIssue({
-            title: newIssue.title,
-            description: formatNewIssueDescription(newIssue, issue.identifier),
-            priority: newIssue.priority === 'urgent' ? 1 : newIssue.priority === 'high' ? 2 : newIssue.priority === 'medium' ? 3 : 4,
-            labelIds: newIssue.labels || [],
+            title,
+            description: `## Bug Found During Verification\n\n**Discovered during:** Verification of ${issue.identifier}\n**Failure:** ${failure.reason}\n\n---\n_Auto-created by QA Shield 🛡️_`,
+            priority: 2,
+            labelIds: [LABELS.BUG],
           });
           createdTickets.push(created);
         } catch (e) {
           console.error('Failed to create ticket:', e);
         }
       }
-    }
-
-    // 6. Post comprehensive report to Linear
-    if (postComment) {
-      const comment = formatVerificationComment(
-        issue,
-        enrichment,
-        verificationReport,
-        secSummary,
-        securityResults,
-        { ours: ourPerf, axiom: axiomPerf, pump: pumpPerf },
-        createdTickets
-      );
-      await addComment(issue.id, comment);
     }
 
     return NextResponse.json({
@@ -143,136 +220,12 @@ export async function POST(req: NextRequest) {
         ],
       },
       createdTickets,
-      commentPosted: postComment,
+      skippedDuplicates,
+      postedComments,
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     console.error('Verify error:', message);
     return NextResponse.json({ error: message }, { status: 500 });
   }
-}
-
-function formatNewIssueDescription(
-  newIssue: { title: string; description: string; stepsToReproduce?: string[]; severity: string },
-  parentIdentifier: string
-): string {
-  let desc = `## Bug\n\n`;
-  desc += `${newIssue.description}\n\n`;
-  desc += `**Discovered during:** Verification of ${parentIdentifier}\n`;
-  desc += `**Severity:** ${newIssue.severity}\n\n`;
-
-  if (newIssue.stepsToReproduce && newIssue.stepsToReproduce.length > 0) {
-    desc += `## Steps to Reproduce\n\n`;
-    newIssue.stepsToReproduce.forEach((step, i) => {
-      desc += `${i + 1}. ${step}\n`;
-    });
-    desc += '\n';
-  }
-
-  desc += `---\n_Auto-created by QA Shield 🛡️ during verification of ${parentIdentifier}_`;
-  return desc;
-}
-
-function formatVerificationComment(
-  issue: { identifier: string; title: string },
-  enrichment: TicketEnrichment | null,
-  report: VerificationReport | null,
-  secSummary: { total: number; passed: number; warnings: number; failed: number },
-  securityResults: any[],
-  benchmark: { ours: any; axiom: any; pump: any },
-  createdTickets: { identifier: string; title: string; url: string }[]
-): string {
-  let c = `## 🛡️ QA Shield — Verification Report\n\n`;
-  c += `**Ticket:** ${issue.identifier} — ${issue.title}\n`;
-  c += `**Verified at:** ${new Date().toISOString()}\n\n`;
-
-  if (report) {
-    // Overall Verdict
-    const verdictIcon = report.overallVerdict === 'pass' ? '✅' : report.overallVerdict === 'fail' ? '❌' : '⚠️';
-    c += `### ${verdictIcon} Overall Verdict: ${report.overallVerdict.toUpperCase()}\n\n`;
-    if (report.verdictSummary) c += `${report.verdictSummary}\n\n`;
-
-    // Steps Executed
-    if (report.stepsExecuted && report.stepsExecuted.length > 0) {
-      c += `### 📋 Steps Executed\n\n`;
-      for (const step of report.stepsExecuted) {
-        const icon = step.status === 'pass' ? '✅' : step.status === 'fail' ? '❌' : step.status === 'skip' ? '⏭️' : '⚠️';
-        c += `${icon} **${step.name}**\n`;
-        if (step.details) c += `  ${step.details}\n`;
-        c += '\n';
-      }
-    }
-
-    // What Passed
-    if (report.passed && report.passed.length > 0) {
-      c += `### ✅ Passed\n\n`;
-      report.passed.forEach(item => {
-        c += `- ${item}\n`;
-      });
-      c += '\n';
-    }
-
-    // What Failed
-    if (report.failed && report.failed.length > 0) {
-      c += `### ❌ Failed\n\n`;
-      report.failed.forEach(item => {
-        c += `- ${item.test}\n  **Reason:** ${item.reason}\n`;
-      });
-      c += '\n';
-    }
-
-    // Not Test Ready
-    if (report.notTestReady && report.notTestReady.length > 0) {
-      c += `### 🚧 Not Test Ready\n\n`;
-      report.notTestReady.forEach(item => {
-        c += `- **${item.area}**: ${item.reason}\n`;
-      });
-      c += '\n';
-    }
-
-    // Cannot Test (Constraints)
-    if (report.cannotTest && report.cannotTest.length > 0) {
-      c += `### 🔒 Cannot Test (Constraints)\n\n`;
-      report.cannotTest.forEach(item => {
-        c += `- **${item.area}**: ${item.constraint}\n`;
-      });
-      c += '\n';
-    }
-  }
-
-  // Security Scan
-  c += `### 🔒 Security Scan\n\n`;
-  c += `✅ ${secSummary.passed} passed | ⚠️ ${secSummary.warnings} warnings | ❌ ${secSummary.failed} failed\n\n`;
-  for (const r of securityResults) {
-    const icon = r.overallStatus === 'pass' ? '✅' : r.overallStatus === 'fail' ? '❌' : '⚠️';
-    const ep = r.endpoint.split('/api')[1] || r.endpoint;
-    const failedChecks = r.checks.filter((ch: any) => ch.status !== 'pass');
-    if (failedChecks.length > 0) {
-      c += `${icon} \`/api${ep}\`\n`;
-      failedChecks.forEach((ch: any) => {
-        c += `  - [${ch.severity.toUpperCase()}] ${ch.details}\n`;
-      });
-    }
-  }
-  c += '\n';
-
-  // Benchmark
-  c += `### ⚡ Performance Benchmark\n\n`;
-  c += `| Platform | Response Time | TTFB |\n`;
-  c += `|----------|--------------|------|\n`;
-  c += `| **creator.fun** | ${benchmark.ours.responseTime}ms | ${benchmark.ours.ttfb}ms |\n`;
-  c += `| axiom.trade | ${benchmark.axiom.responseTime}ms | ${benchmark.axiom.ttfb}ms |\n`;
-  c += `| pump.fun | ${benchmark.pump.responseTime}ms | ${benchmark.pump.ttfb}ms |\n\n`;
-
-  // New Tickets Created
-  if (createdTickets.length > 0) {
-    c += `### 🆕 New Issues Created During Verification\n\n`;
-    createdTickets.forEach(t => {
-      c += `- [${t.identifier}](${t.url}) — ${t.title}\n`;
-    });
-    c += '\n';
-  }
-
-  c += `---\n_Generated by QA Shield 🛡️ — automated verification_`;
-  return c;
 }

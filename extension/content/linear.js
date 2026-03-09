@@ -1,6 +1,6 @@
 /**
- * QA Shield — Linear Content Script
- * Injects enrichment sidebar on Linear issue pages
+ * QA Shield v0.2 — Linear Content Script
+ * Multi-step loading, precision enrichment, clean verification
  */
 
 const QA_SHIELD_API = 'http://localhost:3000';
@@ -8,7 +8,6 @@ const QA_SHIELD_API = 'http://localhost:3000';
 // ============ Issue Detection ============
 
 function getIssueIdentifier() {
-  // URL pattern: /creatorfun/issue/CRX-XXX/...
   const match = window.location.pathname.match(/\/issue\/(CRX-\d+)/);
   return match ? match[1] : null;
 }
@@ -24,12 +23,19 @@ function createSidebar() {
     <div class="qs-header">
       <span class="qs-logo">🛡️</span>
       <span class="qs-title">QA Shield</span>
+      <span class="qs-version">v0.2</span>
       <button class="qs-close" id="qs-close-btn">×</button>
     </div>
     <div class="qs-content" id="qs-content">
-      <div class="qs-loading" id="qs-loading">
-        <div class="qs-spinner"></div>
-        <p>Analyzing ticket...</p>
+      <div class="qs-welcome" id="qs-welcome">
+        <p class="qs-muted">Select an action below to begin.</p>
+      </div>
+      <div class="qs-progress" id="qs-progress" style="display:none">
+        <div class="qs-progress-bar">
+          <div class="qs-progress-fill" id="qs-progress-fill"></div>
+        </div>
+        <div class="qs-steps" id="qs-steps"></div>
+        <div class="qs-elapsed" id="qs-elapsed"></div>
       </div>
       <div class="qs-results" id="qs-results" style="display:none"></div>
     </div>
@@ -43,7 +49,6 @@ function createSidebar() {
 
   document.body.appendChild(sidebar);
 
-  // Event listeners
   document.getElementById('qs-close-btn').addEventListener('click', () => {
     sidebar.classList.toggle('qs-collapsed');
   });
@@ -54,26 +59,121 @@ function createSidebar() {
   document.getElementById('qs-benchmark-btn').addEventListener('click', runBenchmark);
 }
 
+// ============ Progress System ============
+
+let progressTimer = null;
+let progressStart = null;
+
+function showProgress(steps) {
+  const welcome = document.getElementById('qs-welcome');
+  const progress = document.getElementById('qs-progress');
+  const results = document.getElementById('qs-results');
+
+  welcome.style.display = 'none';
+  progress.style.display = 'block';
+  results.style.display = 'none';
+
+  const stepsEl = document.getElementById('qs-steps');
+  stepsEl.innerHTML = steps.map((step, i) => `
+    <div class="qs-step" id="qs-step-${i}" data-status="pending">
+      <span class="qs-step-icon">○</span>
+      <span class="qs-step-text">${step}</span>
+    </div>
+  `).join('');
+
+  document.getElementById('qs-progress-fill').style.width = '0%';
+
+  // Start elapsed timer
+  progressStart = Date.now();
+  const elapsedEl = document.getElementById('qs-elapsed');
+  clearInterval(progressTimer);
+  progressTimer = setInterval(() => {
+    const elapsed = Math.round((Date.now() - progressStart) / 1000);
+    elapsedEl.textContent = `⏱️ ${elapsed}s elapsed`;
+  }, 1000);
+
+  // Disable buttons during operation
+  setButtonsDisabled(true);
+}
+
+function updateStep(index, status) {
+  const step = document.getElementById(`qs-step-${index}`);
+  if (!step) return;
+
+  step.dataset.status = status;
+  const icon = step.querySelector('.qs-step-icon');
+
+  if (status === 'active') icon.textContent = '◉';
+  else if (status === 'done') icon.textContent = '✓';
+  else if (status === 'error') icon.textContent = '✗';
+  else icon.textContent = '○';
+
+  // Update progress bar
+  const allSteps = document.querySelectorAll('.qs-step');
+  const doneCount = document.querySelectorAll('.qs-step[data-status="done"]').length;
+  const activeCount = document.querySelectorAll('.qs-step[data-status="active"]').length;
+  const total = allSteps.length;
+  const pct = Math.round(((doneCount + activeCount * 0.5) / total) * 100);
+  document.getElementById('qs-progress-fill').style.width = `${pct}%`;
+}
+
+function finishProgress() {
+  clearInterval(progressTimer);
+  document.getElementById('qs-progress-fill').style.width = '100%';
+  setButtonsDisabled(false);
+}
+
+function setButtonsDisabled(disabled) {
+  document.querySelectorAll('.qs-btn').forEach(btn => {
+    btn.disabled = disabled;
+    btn.style.opacity = disabled ? '0.5' : '1';
+    btn.style.cursor = disabled ? 'not-allowed' : 'pointer';
+  });
+}
+
 // ============ API Calls ============
 
 async function enrichTicket() {
   const identifier = getIssueIdentifier();
   if (!identifier) return showError('Could not detect ticket ID');
 
-  showLoading('Enriching ticket with AI analysis...');
+  const steps = [
+    'Fetching ticket details...',
+    'Analyzing issue context...',
+    'Generating QA report...',
+    'Posting to Linear...',
+  ];
+  showProgress(steps);
 
   try {
+    updateStep(0, 'active');
+    // Small delay to show the step transition
+    await sleep(300);
+    updateStep(0, 'done');
+
+    updateStep(1, 'active');
     const res = await fetch(`${QA_SHIELD_API}/api/enrich`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ identifier, postComment: true }),
     });
 
+    updateStep(1, 'done');
+    updateStep(2, 'active');
+    await sleep(200);
+
     const data = await res.json();
     if (!data.success) throw new Error(data.error);
 
+    updateStep(2, 'done');
+    updateStep(3, 'active');
+    await sleep(200);
+    updateStep(3, 'done');
+    finishProgress();
+
     showEnrichmentResults(data.enrichment, data.commentPosted);
   } catch (err) {
+    finishProgress();
     showError(`Enrichment failed: ${err.message}`);
   }
 }
@@ -82,11 +182,23 @@ async function verifyFix() {
   const identifier = getIssueIdentifier();
   if (!identifier) return showError('Could not detect ticket ID');
 
-  showLoading('Running full verification...\n⏱️ This takes ~30-60 seconds (AI analysis + security scan + benchmark).\nResults will be posted to Linear.');
+  const steps = [
+    'Fetching ticket details...',
+    'Running fix verification...',
+    'Scanning security...',
+    'Benchmarking performance...',
+    'Posting results to Linear...',
+  ];
+  showProgress(steps);
 
   try {
+    updateStep(0, 'active');
+    await sleep(300);
+    updateStep(0, 'done');
+
+    updateStep(1, 'active');
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120000); // 2 min timeout
+    const timeout = setTimeout(() => controller.abort(), 180000);
 
     const res = await fetch(`${QA_SHIELD_API}/api/verify`, {
       method: 'POST',
@@ -96,18 +208,23 @@ async function verifyFix() {
     });
 
     clearTimeout(timeout);
+    updateStep(1, 'done');
+    updateStep(2, 'done');
+    updateStep(3, 'done');
+    updateStep(4, 'active');
+    await sleep(200);
+
     const data = await res.json();
     if (!data.success) throw new Error(data.error);
 
-    // Show full verification with new issues created
-    if (data.verification) {
-      showFullVerificationResults(data);
-    } else {
-      showVerificationResults(data.security, data.benchmark, data.commentPosted);
-    }
+    updateStep(4, 'done');
+    finishProgress();
+
+    showVerificationResults(data);
   } catch (err) {
+    finishProgress();
     if (err.name === 'AbortError') {
-      showError('Verification timed out (>2 min). The backend may still be processing — check the Linear ticket for results.');
+      showError('Verification timed out (>3 min). Check the Linear ticket for partial results.');
     } else {
       showError(`Verification failed: ${err.message}`);
     }
@@ -116,113 +233,143 @@ async function verifyFix() {
 
 async function runSecurityScan() {
   const identifier = getIssueIdentifier();
-  showLoading('Running security scan...\nResults will be posted to Linear.');
+  const steps = ['Scanning API endpoints...', 'Analyzing results...', 'Posting to Linear...'];
+  showProgress(steps);
 
   try {
+    updateStep(0, 'active');
     const res = await fetch(`${QA_SHIELD_API}/api/security/scan`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ identifier, postComment: true }),
     });
 
+    updateStep(0, 'done');
+    updateStep(1, 'active');
     const data = await res.json();
     if (!data.success) throw new Error(data.error);
 
+    updateStep(1, 'done');
+    updateStep(2, 'done');
+    finishProgress();
+
     showSecurityResults(data);
   } catch (err) {
+    finishProgress();
     showError(`Security scan failed: ${err.message}`);
   }
 }
 
 async function runBenchmark() {
-  const identifier = getIssueIdentifier();
-  showLoading('Running performance benchmark against competitors...\nResults will be posted to Linear.');
+  const steps = ['Measuring creator.fun...', 'Measuring competitors...', 'Comparing results...'];
+  showProgress(steps);
 
   try {
-    const res = await fetch(`${QA_SHIELD_API}/api/monitor/health?mode=benchmark`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier, postComment: true }),
-    });
+    updateStep(0, 'active');
+    const res = await fetch(`${QA_SHIELD_API}/api/monitor/health?mode=benchmark`);
 
+    updateStep(0, 'done');
+    updateStep(1, 'done');
+    updateStep(2, 'active');
     const data = await res.json();
+
+    updateStep(2, 'done');
+    finishProgress();
+
     showBenchmarkResults(data);
   } catch (err) {
-    // Fallback to GET if POST not supported
-    try {
-      const res = await fetch(`${QA_SHIELD_API}/api/monitor/health?mode=benchmark`);
-      const data = await res.json();
-      showBenchmarkResults(data);
-    } catch (err2) {
-      showError(`Benchmark failed: ${err2.message}`);
-    }
+    finishProgress();
+    showError(`Benchmark failed: ${err.message}`);
   }
 }
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 // ============ Result Renderers ============
 
-function showLoading(msg) {
-  const loading = document.getElementById('qs-loading');
-  const results = document.getElementById('qs-results');
-  loading.style.display = 'block';
-  loading.querySelector('p').textContent = msg;
-  results.style.display = 'none';
-}
-
 function showError(msg) {
-  const loading = document.getElementById('qs-loading');
+  const progress = document.getElementById('qs-progress');
   const results = document.getElementById('qs-results');
-  loading.style.display = 'none';
+  const welcome = document.getElementById('qs-welcome');
+  progress.style.display = 'none';
+  welcome.style.display = 'none';
   results.style.display = 'block';
   results.innerHTML = `<div class="qs-error">❌ ${msg}</div>`;
 }
 
 function showEnrichmentResults(enrichment, commentPosted) {
-  const loading = document.getElementById('qs-loading');
+  const progress = document.getElementById('qs-progress');
   const results = document.getElementById('qs-results');
-  loading.style.display = 'none';
+  progress.style.display = 'none';
   results.style.display = 'block';
 
-  const severityColors = { critical: '#ef4444', high: '#f97316', medium: '#eab308', low: '#22c55e' };
-  const sevColor = severityColors[enrichment.impact.severity] || '#666';
+  const e = enrichment;
+  const sevColors = { critical: '#ef4444', high: '#f97316', medium: '#eab308', low: '#22c55e' };
+  const typeEmojis = { bug: '🐛', improvement: '✨', feature: '🆕', refactor: '🔧', hotfix: '🚨' };
 
   results.innerHTML = `
     <div class="qs-section">
-      <h3>📋 Classification</h3>
-      <div class="qs-tags">
-        <span class="qs-tag">${enrichment.issueType.toUpperCase()}</span>
-        <span class="qs-tag" style="background:${sevColor}">${enrichment.impact.severity.toUpperCase()}</span>
-        <span class="qs-tag">${enrichment.priorityRecommendation.level.toUpperCase()}</span>
+      <div class="qs-verdict-banner qs-verdict-${e.classification?.type || 'bug'}">
+        <span class="qs-verdict-icon">${typeEmojis[e.classification?.type] || '📋'}</span>
+        <span class="qs-verdict-label">${(e.classification?.type || 'UNKNOWN').toUpperCase()}</span>
+        <span class="qs-tag" style="background:${sevColors[e.impact?.severity] || '#666'}">${(e.impact?.severity || 'unknown').toUpperCase()}</span>
       </div>
-      ${enrichment.impact.financialImpact ? '<div class="qs-alert">⚠️ Financial Impact</div>' : ''}
-      ${enrichment.impact.securityImpact ? '<div class="qs-alert qs-alert-danger">🔴 Security Impact</div>' : ''}
+      <p class="qs-classification-reason">${e.classification?.reasoning || ''}</p>
     </div>
 
     <div class="qs-section">
-      <h3>🔍 Root Cause</h3>
-      <p><strong>Caused by:</strong> ${enrichment.rootCause.causedBy}</p>
-      <p>${enrichment.rootCause.summary}</p>
+      <h3>🔍 What Went Wrong</h3>
+      <p>${e.whatWentWrong?.summary || 'N/A'}</p>
+      <div class="qs-detail-grid">
+        <div class="qs-detail-item"><span class="qs-detail-label">Root Cause</span><span>${e.whatWentWrong?.rootCause || 'N/A'}</span></div>
+        <div class="qs-detail-item"><span class="qs-detail-label">Component</span><span class="qs-code">${e.whatWentWrong?.component || 'N/A'}</span></div>
+        <div class="qs-detail-item"><span class="qs-detail-label">Category</span><span>${e.whatWentWrong?.category || 'N/A'}</span></div>
+      </div>
     </div>
 
     <div class="qs-section">
-      <h3>✅ Test Cases (${enrichment.testCases.length})</h3>
-      ${enrichment.testCases.map(tc => `
+      <h3>📐 Impact & Scope</h3>
+      <p>${e.impact?.scope || 'N/A'}</p>
+      <p class="qs-muted">Affected: ${e.impact?.affectedUsers || 'Unknown'}</p>
+      ${e.impact?.financialImpact ? '<div class="qs-alert">⚠️ Financial Impact</div>' : ''}
+      ${e.impact?.securityImpact ? '<div class="qs-alert qs-alert-danger">🔴 Security Impact</div>' : ''}
+    </div>
+
+    <div class="qs-section">
+      <h3>🔄 Steps to Reproduce</h3>
+      <ol class="qs-tc-steps">
+        ${(e.stepsToReproduce || []).map(s => `<li>${s}</li>`).join('')}
+      </ol>
+      <div class="qs-expected-actual">
+        <div><strong>Expected:</strong> ${e.expectedBehavior || 'N/A'}</div>
+        <div><strong>Actual:</strong> ${e.actualBehavior || 'N/A'}</div>
+      </div>
+    </div>
+
+    <div class="qs-section">
+      <h3>🛠️ Recommended Fix</h3>
+      <p>${e.recommendedFix?.approach || 'N/A'}</p>
+      ${(e.recommendedFix?.filesLikelyInvolved || []).length > 0 ? `<p class="qs-muted">Files: ${e.recommendedFix.filesLikelyInvolved.map(f => `<code>${f}</code>`).join(', ')}</p>` : ''}
+      <p class="qs-muted">Effort: ${e.recommendedFix?.estimatedEffort || 'unknown'}</p>
+    </div>
+
+    <div class="qs-section">
+      <h3>✅ Test Cases (${(e.testCases || []).length})</h3>
+      ${(e.testCases || []).map(tc => `
         <div class="qs-test-case">
           <div class="qs-tc-header">
             <span class="qs-tc-badge qs-tc-${tc.priority}">${tc.priority.toUpperCase()}</span>
             <strong>${tc.id}: ${tc.title}</strong>
           </div>
-          <ol class="qs-tc-steps">
-            ${tc.steps.map(s => `<li>${s}</li>`).join('')}
-          </ol>
+          <ol class="qs-tc-steps">${tc.steps.map(s => `<li>${s}</li>`).join('')}</ol>
           <div class="qs-tc-expected">Expected: ${tc.expected}</div>
         </div>
       `).join('')}
     </div>
 
     <div class="qs-section">
-      <h3>⚡ Edge Cases (${enrichment.edgeCases.length})</h3>
-      ${enrichment.edgeCases.map(ec => `
+      <h3>⚡ Edge Cases (${(e.edgeCases || []).length})</h3>
+      ${(e.edgeCases || []).map(ec => `
         <div class="qs-edge-case">
           <span class="qs-tag qs-tag-${ec.risk}">${ec.risk}</span>
           <strong>${ec.scenario}</strong>
@@ -231,116 +378,45 @@ function showEnrichmentResults(enrichment, commentPosted) {
       `).join('')}
     </div>
 
+    ${(e.postFixVerification || []).length > 0 ? `
     <div class="qs-section">
-      <h3>🗺️ Impacted Areas</h3>
-      ${enrichment.impactedAreas.map(ia => `
-        <div class="qs-impact-item ${ia.checkRequired ? 'qs-check-required' : ''}">
-          ${ia.checkRequired ? '⚠️' : 'ℹ️'} <strong>${ia.page}</strong> → ${ia.component}: ${ia.reason}
-        </div>
-      `).join('') || '<p class="qs-muted">No additional areas identified</p>'}
-    </div>
+      <h3>🔎 Post-Fix Checklist</h3>
+      ${e.postFixVerification.map(item => `<div class="qs-impact-item">☐ ${item}</div>`).join('')}
+    </div>` : ''}
 
-    ${commentPosted ? '<div class="qs-success">✅ Enrichment posted to Linear ticket</div>' : ''}
+    ${commentPosted ? '<div class="qs-success">✅ Analysis posted to Linear ticket</div>' : ''}
   `;
 }
 
-function showVerificationResults(security, benchmark, commentPosted) {
-  const loading = document.getElementById('qs-loading');
+function showVerificationResults(data) {
+  const progress = document.getElementById('qs-progress');
   const results = document.getElementById('qs-results');
-  loading.style.display = 'none';
-  results.style.display = 'block';
-
-  const secSummary = security?.summary || { passed: 0, warnings: 0, failed: 0 };
-  const competitors = benchmark?.competitors || [];
-
-  results.innerHTML = `
-    <div class="qs-section">
-      <h3>✅ Verification Report</h3>
-      <div class="qs-summary-grid">
-        <div class="qs-summary-item">
-          <span class="qs-big-num">${secSummary.passed}</span>
-          <span>Security ✅</span>
-        </div>
-        <div class="qs-summary-item">
-          <span class="qs-big-num qs-yellow">${secSummary.warnings}</span>
-          <span>Warnings</span>
-        </div>
-        <div class="qs-summary-item">
-          <span class="qs-big-num ${secSummary.failed > 0 ? 'qs-red' : ''}">${secSummary.failed}</span>
-          <span>Security ❌</span>
-        </div>
-      </div>
-    </div>
-
-    <div class="qs-section">
-      <h3>🔒 Security Scan</h3>
-      ${(security?.results || []).map(r => {
-        const failedChecks = r.checks.filter(c => c.status !== 'pass');
-        if (failedChecks.length === 0) return '';
-        return `
-          <div class="qs-scan-result qs-scan-${r.overallStatus}">
-            <strong>${r.endpoint.split('/api')[1] ? '/api' + r.endpoint.split('/api')[1] : r.endpoint}</strong>
-            ${failedChecks.map(c => `
-              <div class="qs-check-detail">⚠️ [${c.type}] ${c.details}</div>
-            `).join('')}
-          </div>
-        `;
-      }).join('') || '<p>No security issues found</p>'}
-    </div>
-
-    <div class="qs-section">
-      <h3>⚡ Performance vs Competitors</h3>
-      <div class="qs-benchmark-row">
-        <span><strong>creator.fun</strong></span>
-        <span>${benchmark?.ours?.responseTime || 'N/A'}ms</span>
-      </div>
-      ${competitors.map(c => `
-        <div class="qs-benchmark-row">
-          <span>${c.name}</span>
-          <span>${c.result?.responseTime || 'N/A'}ms</span>
-        </div>
-      `).join('')}
-    </div>
-
-    ${commentPosted ? '<div class="qs-success">✅ Full report posted to Linear ticket</div>' : ''}
-  `;
-}
-
-function showFullVerificationResults(data) {
-  const loading = document.getElementById('qs-loading');
-  const results = document.getElementById('qs-results');
-  loading.style.display = 'none';
+  progress.style.display = 'none';
   results.style.display = 'block';
 
   const v = data.verification;
-  const sec = data.security?.summary || {};
+  if (!v) {
+    results.innerHTML = '<div class="qs-error">No verification data returned</div>';
+    return;
+  }
+
   const verdictIcon = v.overallVerdict === 'pass' ? '✅' : v.overallVerdict === 'fail' ? '❌' : '⚠️';
-  const verdictColor = v.overallVerdict === 'pass' ? '#22c55e' : v.overallVerdict === 'fail' ? '#ef4444' : '#eab308';
+  const verdictClass = v.overallVerdict === 'pass' ? 'pass' : v.overallVerdict === 'fail' ? 'fail' : 'partial';
+  const verdictText = v.overallVerdict === 'pass' ? 'VERIFICATION PASSED' : v.overallVerdict === 'fail' ? 'VERIFICATION FAILED' : 'PARTIAL VERIFICATION';
 
   let html = `
-    <div class="qs-section">
-      <h3 style="color:${verdictColor}">${verdictIcon} Verdict: ${v.overallVerdict.toUpperCase()}</h3>
-      <p>${v.verdictSummary || ''}</p>
-      <div class="qs-summary-grid">
-        <div class="qs-summary-item">
-          <span class="qs-big-num">${(v.passed || []).length}</span>
-          <span>Passed</span>
-        </div>
-        <div class="qs-summary-item">
-          <span class="qs-big-num qs-red">${(v.failed || []).length}</span>
-          <span>Failed</span>
-        </div>
-        <div class="qs-summary-item">
-          <span class="qs-big-num">${(v.newIssuesFound || []).length}</span>
-          <span>New Issues</span>
-        </div>
-      </div>
-    </div>`;
+    <div class="qs-verdict-banner qs-verdict-${verdictClass}">
+      <span class="qs-verdict-icon">${verdictIcon}</span>
+      <span class="qs-verdict-label">${verdictText}</span>
+    </div>
+    <p class="qs-verdict-summary">${v.verdictSummary || ''}</p>
+  `;
 
-  // Steps Executed
-  if (v.stepsExecuted && v.stepsExecuted.length > 0) {
-    html += `<div class="qs-section"><h3>📋 Steps Executed</h3>`;
-    v.stepsExecuted.forEach(s => {
+  // Fix Verification
+  const fv = v.fixVerification || {};
+  if (fv.stepsExecuted && fv.stepsExecuted.length > 0) {
+    html += `<div class="qs-section"><h3>📋 Fix Verification</h3>`;
+    fv.stepsExecuted.forEach(s => {
       const icon = s.status === 'pass' ? '✅' : s.status === 'fail' ? '❌' : s.status === 'skip' ? '⏭️' : '⚠️';
       html += `<div class="qs-test-case"><strong>${icon} ${s.name}</strong><p class="qs-hint">${s.details || ''}</p></div>`;
     });
@@ -348,71 +424,68 @@ function showFullVerificationResults(data) {
   }
 
   // Passed
-  if (v.passed && v.passed.length > 0) {
+  if (fv.passed && fv.passed.length > 0) {
     html += `<div class="qs-section"><h3>✅ Passed</h3>`;
-    v.passed.forEach(p => { html += `<div class="qs-impact-item">✅ ${p}</div>`; });
+    fv.passed.forEach(p => { html += `<div class="qs-impact-item">✅ ${p}</div>`; });
     html += `</div>`;
   }
 
   // Failed
-  if (v.failed && v.failed.length > 0) {
+  if (fv.failed && fv.failed.length > 0) {
     html += `<div class="qs-section"><h3>❌ Failed</h3>`;
-    v.failed.forEach(f => {
+    fv.failed.forEach(f => {
       html += `<div class="qs-test-case" style="border-left:3px solid #ef4444;padding-left:8px">
         <strong>${f.test}</strong><p class="qs-hint" style="color:#ef4444">→ ${f.reason}</p></div>`;
     });
     html += `</div>`;
   }
 
-  // Not Test Ready
-  if (v.notTestReady && v.notTestReady.length > 0) {
-    html += `<div class="qs-section"><h3>🚧 Not Test Ready</h3>`;
-    v.notTestReady.forEach(n => {
-      html += `<div class="qs-impact-item">🚧 <strong>${n.area}</strong>: ${n.reason}</div>`;
-    });
-    html += `</div>`;
-  }
-
   // Cannot Test
-  if (v.cannotTest && v.cannotTest.length > 0) {
-    html += `<div class="qs-section"><h3>🔒 Cannot Test (Constraints)</h3>`;
-    v.cannotTest.forEach(c => {
+  if (fv.cannotTest && fv.cannotTest.length > 0) {
+    html += `<div class="qs-section"><h3>🔒 Cannot Test</h3>`;
+    fv.cannotTest.forEach(c => {
       html += `<div class="qs-impact-item">🔒 <strong>${c.area}</strong>: ${c.constraint}</div>`;
     });
     html += `</div>`;
   }
 
-  // Security Summary
-  html += `<div class="qs-section"><h3>🔒 Security: ${sec.passed || 0}✅ ${sec.warnings || 0}⚠️ ${sec.failed || 0}❌</h3></div>`;
-
-  // Benchmark
-  if (data.benchmark) {
-    html += `<div class="qs-section"><h3>⚡ Performance</h3>
-      <div class="qs-benchmark-row"><span><strong>creator.fun</strong></span><span>${data.benchmark.ours?.responseTime || 'N/A'}ms</span></div>`;
-    (data.benchmark.competitors || []).forEach(c => {
-      html += `<div class="qs-benchmark-row"><span>${c.name}</span><span>${c.result?.responseTime || 'N/A'}ms</span></div>`;
+  // Sanity Checks
+  const sc = v.sanityChecks;
+  if (sc && sc.checks && sc.checks.length > 0) {
+    html += `<div class="qs-section"><h3>🧪 Sanity Checks</h3>`;
+    sc.checks.forEach(check => {
+      const icon = check.status === 'pass' ? '✅' : check.status === 'fail' ? '❌' : '⚠️';
+      html += `<div class="qs-impact-item">${icon} <strong>${check.name}</strong>: ${check.details}</div>`;
     });
     html += `</div>`;
   }
 
-  // New Tickets Created
-  if (data.createdTickets && data.createdTickets.length > 0) {
-    html += `<div class="qs-section"><h3>🆕 New Tickets Created</h3>`;
-    data.createdTickets.forEach(t => {
-      html += `<div class="qs-impact-item qs-check-required">🎫 <a href="${t.url}" target="_blank" style="color:#6366f1">${t.identifier}</a> — ${t.title}</div>`;
-    });
-    html += `</div>`;
+  // Regression Risk
+  if (v.regressionRisk) {
+    const riskColor = v.regressionRisk.level === 'high' ? '#ef4444' : v.regressionRisk.level === 'medium' ? '#eab308' : '#22c55e';
+    html += `<div class="qs-section"><h3>🎯 Regression Risk: <span style="color:${riskColor}">${v.regressionRisk.level.toUpperCase()}</span></h3>`;
+    html += `<p class="qs-hint">${v.regressionRisk.recommendation}</p></div>`;
   }
 
-  html += `${data.commentPosted ? '<div class="qs-success">✅ Full report posted to Linear ticket</div>' : ''}`;
+  // Security & Performance summaries (compact since separate comments exist)
+  const sec = data.security?.summary || {};
+  html += `<div class="qs-section qs-compact">
+    <span>🔒 Security: ${sec.passed || 0}✅ ${sec.warnings || 0}⚠️ ${sec.failed || 0}❌</span>
+    <span class="qs-muted"> · ⚡ Performance: ${data.benchmark?.ours?.responseTime || 'N/A'}ms</span>
+  </div>`;
+
+  // Posted comments
+  if (data.postedComments && data.postedComments.length > 0) {
+    html += `<div class="qs-success">✅ ${data.postedComments.length} comments posted to Linear</div>`;
+  }
 
   results.innerHTML = html;
 }
 
 function showSecurityResults(data) {
-  const loading = document.getElementById('qs-loading');
+  const progress = document.getElementById('qs-progress');
   const results = document.getElementById('qs-results');
-  loading.style.display = 'none';
+  progress.style.display = 'none';
   results.style.display = 'block';
 
   results.innerHTML = `
@@ -440,9 +513,9 @@ function showSecurityResults(data) {
 }
 
 function showBenchmarkResults(data) {
-  const loading = document.getElementById('qs-loading');
+  const progress = document.getElementById('qs-progress');
   const results = document.getElementById('qs-results');
-  loading.style.display = 'none';
+  progress.style.display = 'none';
   results.style.display = 'block';
 
   results.innerHTML = `
@@ -477,17 +550,17 @@ function init() {
   const identifier = getIssueIdentifier();
   if (identifier) {
     createSidebar();
-    console.log(`[QA Shield] 🛡️ Active on ${identifier}`);
+    console.log(`[QA Shield] 🛡️ v0.2 Active on ${identifier}`);
   }
 }
 
-// Watch for SPA navigation
 let lastUrl = window.location.href;
 new MutationObserver(() => {
   if (window.location.href !== lastUrl) {
     lastUrl = window.location.href;
     const existing = document.getElementById('qa-shield-sidebar');
     if (existing) existing.remove();
+    clearInterval(progressTimer);
     init();
   }
 }).observe(document.body, { childList: true, subtree: true });

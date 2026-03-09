@@ -168,6 +168,47 @@ export async function createIssue(input: {
   return data.issueCreate.issue;
 }
 
+// ============ Duplicate Detection ============
+
+export async function findSimilarIssue(titleKeywords: string): Promise<LinearIssue | null> {
+  const { teamId } = getConfig();
+  // Extract key words (3+ chars) for search
+  const words = titleKeywords.toLowerCase().split(/[\s\[\]\(\):\-,]+/).filter(w => w.length >= 3);
+  const searchTerms = words.slice(0, 5).join(' ');
+
+  try {
+    const data = await linearQuery(`
+      query SearchIssues($teamId: String!, $search: String!) {
+        searchIssues(term: $search, filter: { team: { id: { eq: $teamId } } }, first: 5) {
+          nodes {
+            id identifier title description priority url createdAt updatedAt
+            state { id name type }
+            assignee { id name email }
+            labels { nodes { id name } }
+            comments { nodes { id body createdAt user { name } } }
+          }
+        }
+      }
+    `, { teamId, search: searchTerms });
+
+    const matches = data.searchIssues?.nodes || [];
+    if (matches.length === 0) return null;
+
+    // Check for close title match (>60% word overlap)
+    for (const match of matches) {
+      const matchWords = match.title.toLowerCase().split(/[\s\[\]\(\):\-,]+/).filter((w: string) => w.length >= 3);
+      const overlap = words.filter(w => matchWords.includes(w)).length;
+      const similarity = overlap / Math.max(words.length, 1);
+      if (similarity >= 0.5) return match;
+    }
+
+    return null;
+  } catch (err) {
+    console.error('findSimilarIssue error:', err);
+    return null;
+  }
+}
+
 // ============ Team Queries ============
 
 export async function getTeamIssues(stateFilter?: string, limit = 50) {

@@ -1,7 +1,7 @@
 /**
  * POST /api/enrich
- * Enriches a Linear ticket with AI-generated QA context
- * Also posts the enrichment as a comment on the Linear ticket
+ * Enriches a Linear ticket with precise QA analysis
+ * Posts structured enrichment as a comment on the Linear ticket
  */
 
 import { NextRequest, NextResponse } from 'next/server';
@@ -25,8 +25,6 @@ export async function POST(req: NextRequest) {
 
     // 2. Build AI prompt and get enrichment
     const prompt = buildEnrichmentPrompt(issue);
-
-    // Call AI (Anthropic Claude or OpenAI)
     let enrichment: TicketEnrichment;
 
     if (process.env.ANTHROPIC_API_KEY) {
@@ -40,8 +38,8 @@ export async function POST(req: NextRequest) {
         body: JSON.stringify({
           model: 'claude-sonnet-4-20250514',
           max_tokens: 4096,
-          temperature: 0.3,
-          system: 'You are QA Shield, an expert QA analyst for a Web3 trading platform. Respond ONLY with valid JSON. No markdown, no explanation, just the JSON object.',
+          temperature: 0.2,
+          system: 'You are QA Shield, a senior QA automation engineer. Respond ONLY with valid JSON matching the exact structure requested. No markdown wrapping, no explanation — just the JSON object.',
           messages: [{ role: 'user', content: prompt }],
         }),
       });
@@ -50,7 +48,6 @@ export async function POST(req: NextRequest) {
       if (aiResponse.error) throw new Error(aiResponse.error.message);
 
       const content = aiResponse.content?.[0]?.text || '{}';
-      // Extract JSON from potential markdown code blocks
       const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, content];
       enrichment = JSON.parse(jsonMatch[1].trim());
     } else if (process.env.OPENAI_API_KEY) {
@@ -60,16 +57,15 @@ export async function POST(req: NextRequest) {
       const completion = await openai.chat.completions.create({
         model: 'gpt-4o',
         messages: [
-          { role: 'system', content: 'You are QA Shield, an expert QA analyst. Respond ONLY with valid JSON.' },
+          { role: 'system', content: 'You are QA Shield, a senior QA automation engineer. Respond ONLY with valid JSON.' },
           { role: 'user', content: prompt },
         ],
         response_format: { type: 'json_object' },
-        temperature: 0.3,
+        temperature: 0.2,
       });
 
       enrichment = JSON.parse(completion.choices[0].message.content || '{}');
     } else {
-      // Fallback: generate a structured template without AI
       enrichment = generateFallbackEnrichment(issue);
     }
 
@@ -94,7 +90,7 @@ export async function POST(req: NextRequest) {
   }
 }
 
-// GET: Quick lookup for extension
+// GET: Quick lookup
 export async function GET(req: NextRequest) {
   const identifier = req.nextUrl.searchParams.get('identifier');
   if (!identifier) {
@@ -113,63 +109,61 @@ export async function GET(req: NextRequest) {
 function generateFallbackEnrichment(issue: { title: string; description: string; labels: { nodes: { name: string }[] } }): TicketEnrichment {
   const isUI = issue.labels.nodes.some(l => l.name === 'Frontend') || /ui|css|style|layout|responsive/i.test(issue.title);
   const isBackend = issue.labels.nodes.some(l => l.name === 'Backend') || /api|endpoint|server|database/i.test(issue.title);
-  const isBug = issue.labels.nodes.some(l => l.name === 'Bug');
+  const isBug = issue.labels.nodes.some(l => l.name === 'Bug') || /bug|fix|broken|error|crash/i.test(issue.title);
 
   return {
-    issueType: isUI && isBackend ? 'mixed' : isUI ? 'ui' : isBackend ? 'backend' : 'mixed',
-    priorityRecommendation: {
-      level: isBug ? 'high' : 'medium',
-      score: isBug ? 2 : 3,
-      reasoning: 'Auto-classified based on labels and title keywords',
+    classification: {
+      type: isBug ? 'bug' : 'improvement',
+      reasoning: 'Auto-classified based on labels and title keywords (no AI available)',
     },
-    rootCause: {
-      summary: `Issue identified in: ${issue.title}`,
-      causedBy: 'Requires investigation',
+    whatWentWrong: {
+      summary: issue.title,
+      rootCause: 'Requires manual investigation',
+      component: 'Unknown — needs investigation',
       category: isBug ? 'bug' : 'improvement',
-    },
-    scope: {
-      summary: issue.description?.slice(0, 200) || issue.title,
-      affectedPages: ['Requires investigation'],
-      affectedComponents: ['Requires investigation'],
-      affectedEndpoints: isBackend ? ['Requires investigation'] : [],
     },
     impact: {
       severity: isBug ? 'high' : 'medium',
-      userFacing: isUI,
-      financialImpact: /pnl|price|trade|buy|sell|fee|reward/i.test(issue.title + issue.description),
-      securityImpact: /auth|cors|security|token|wallet/i.test(issue.title + issue.description),
-      description: 'Impact assessment requires manual review',
+      scope: 'Requires investigation',
+      affectedUsers: 'Unknown',
+      affectedPages: ['Requires investigation'],
+      affectedEndpoints: isBackend ? ['Requires investigation'] : [],
+      financialImpact: /pnl|price|trade|buy|sell|fee|reward/i.test(issue.title + (issue.description || '')),
+      securityImpact: /auth|cors|security|token|wallet/i.test(issue.title + (issue.description || '')),
+    },
+    stepsToReproduce: [
+      '1. Navigate to the affected area on dev.creator.fun',
+      '2. Follow the ticket description',
+      '3. Observe the issue',
+    ],
+    expectedBehavior: 'As described in the ticket',
+    actualBehavior: issue.title,
+    recommendedFix: {
+      approach: 'Requires investigation',
+      filesLikelyInvolved: [],
+      estimatedEffort: 'medium',
     },
     testCases: [
       {
         id: 'TC-1',
         title: 'Verify the fix resolves the reported issue',
-        steps: ['Navigate to the affected area', 'Reproduce the original issue steps', 'Verify the fix is applied'],
-        expected: 'Issue is resolved as described in the ticket',
+        steps: ['Navigate to affected area', 'Reproduce original steps', 'Verify fix'],
+        expected: 'Issue is resolved',
         priority: 'must',
       },
     ],
     edgeCases: [
       {
         id: 'EC-1',
-        scenario: 'Test with different user roles and states',
+        scenario: 'Test with different user states',
         risk: 'medium',
-        howToTest: 'Try as logged-out user, new user, and existing user',
+        howToTest: 'Try as logged-out, new user, and existing user',
       },
     ],
-    impactedAreas: [],
-    responsiveness: isUI ? [
-      { breakpoint: 'mobile', viewport: '375x667', elementsToCheck: ['Main content area', 'Navigation', 'Buttons'] },
-      { breakpoint: 'tablet', viewport: '768x1024', elementsToCheck: ['Layout grid', 'Sidebar', 'Tables'] },
-      { breakpoint: 'desktop', viewport: '1920x1080', elementsToCheck: ['Full layout', 'Charts', 'Data tables'] },
-    ] : [],
-    securityChecks: isBackend ? [
-      { endpoint: 'TBD', checkType: 'auth', description: 'Verify endpoint requires authentication', severity: 'high' },
-      { endpoint: 'TBD', checkType: 'cors', description: 'Verify CORS policy is properly configured', severity: 'high' },
-    ] : [],
-    performanceBenchmarks: [
-      { metric: 'Page load time', competitor: 'axiom.trade', status: 'untested', threshold: 'Should be under 2000ms' },
-      { metric: 'API response time', competitor: 'pump.fun', status: 'untested', threshold: 'Should be under 500ms' },
-    ],
+    postFixVerification: ['Verify the fix on dev.creator.fun', 'Check for regressions in related areas'],
+    priorityRecommendation: {
+      level: isBug ? 'high' : 'medium',
+      reasoning: 'Auto-classified — needs AI for precise assessment',
+    },
   };
 }
