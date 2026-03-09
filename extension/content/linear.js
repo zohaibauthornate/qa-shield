@@ -358,11 +358,11 @@ function showEnrichmentResults(enrichment, commentPosted) {
       ${(e.testCases || []).map(tc => `
         <div class="qs-test-case">
           <div class="qs-tc-header">
-            <span class="qs-tc-badge qs-tc-${tc.priority}">${tc.priority.toUpperCase()}</span>
-            <strong>${tc.id}: ${tc.title}</strong>
+            <span class="qs-tc-badge qs-tc-${tc.priority || 'should'}">${(tc.priority || 'should').toUpperCase()}</span>
+            <strong>${tc.id || ''}: ${tc.title || ''}</strong>
           </div>
-          <ol class="qs-tc-steps">${tc.steps.map(s => `<li>${s}</li>`).join('')}</ol>
-          <div class="qs-tc-expected">Expected: ${tc.expected}</div>
+          <ol class="qs-tc-steps">${(tc.steps || []).map(s => `<li>${s}</li>`).join('')}</ol>
+          <div class="qs-tc-expected">Expected: ${tc.expected || 'N/A'}</div>
         </div>
       `).join('')}
     </div>
@@ -371,9 +371,9 @@ function showEnrichmentResults(enrichment, commentPosted) {
       <h3>⚡ Edge Cases (${(e.edgeCases || []).length})</h3>
       ${(e.edgeCases || []).map(ec => `
         <div class="qs-edge-case">
-          <span class="qs-tag qs-tag-${ec.risk}">${ec.risk}</span>
-          <strong>${ec.scenario}</strong>
-          <p class="qs-hint">→ ${ec.howToTest}</p>
+          <span class="qs-tag qs-tag-${ec.risk || 'medium'}">${(ec.risk || 'medium').toUpperCase()}</span>
+          <strong>${ec.scenario || ''}</strong>
+          <p class="qs-hint">→ ${ec.howToTest || ''}</p>
         </div>
       `).join('')}
     </div>
@@ -462,9 +462,10 @@ function showVerificationResults(data) {
 
   // Regression Risk
   if (v.regressionRisk) {
-    const riskColor = v.regressionRisk.level === 'high' ? '#ef4444' : v.regressionRisk.level === 'medium' ? '#eab308' : '#22c55e';
-    html += `<div class="qs-section"><h3>🎯 Regression Risk: <span style="color:${riskColor}">${v.regressionRisk.level.toUpperCase()}</span></h3>`;
-    html += `<p class="qs-hint">${v.regressionRisk.recommendation}</p></div>`;
+    const riskLevel = v.regressionRisk.level || 'low';
+    const riskColor = riskLevel === 'high' ? '#ef4444' : riskLevel === 'medium' ? '#eab308' : '#22c55e';
+    html += `<div class="qs-section"><h3>🎯 Regression Risk: <span style="color:${riskColor}">${riskLevel.toUpperCase()}</span></h3>`;
+    html += `<p class="qs-hint">${v.regressionRisk.recommendation || ''}</p></div>`;
   }
 
   // Security & Performance summaries (compact since separate comments exist)
