@@ -1,223 +1,125 @@
-# QA Shield — Chrome Extension + Backend Report
+# QA Shield — Extension Report
 
 **Owner:** Chief QA (zohaib@authornate.com)
 **Date:** March 2026
-**Platform:** Chrome Extension (Manifest V3) + Next.js Backend + Playwright Browser Worker
+**Platform:** Chrome Extension (MV3) + Next.js Backend + Playwright Browser Worker
 
 ---
 
 ## Core Idea
 
-The creator.fun codebase is being actively revamped with AI-assisted development. More code shipping faster means quality control becomes the bottleneck — and a manual QA process doesn't scale with AI-accelerated output.
+creator.fun is being rebuilt with AI. More code ships faster — but quality control can't keep up manually.
 
-**QA Shield exists to close that gap.** It automates the QA layer so that as development velocity increases, quality assurance keeps pace — without adding headcount or manual toil. The goal is not just to catch bugs faster, but to build a feedback loop that makes the entire development process smarter: developers get instant, structured verification on every fix; security gaps are surfaced before they compound; performance regressions are caught at the ticket level, not after deployment.
+**QA Shield bridges that gap.** It sits inside Linear and automates the full QA cycle: enriching tickets for developers, verifying fixes, scanning for security issues, and benchmarking APIs — all without leaving the ticket page.
 
-In short: **AI writes the code, QA Shield enriches the ticket, verifies the fix, and closes the loop.**
-
----
-
-## Problem Statement
-
-When developers push fixes to Linear tickets and move them to **In Review**, a QA engineer must manually:
-
-- Navigate to the live staging environment and reproduce the original issue
-- Check API responses match expected data shapes
-- Inspect DOM for correct UI rendering, layout, and state
-- Run security scans to catch exposed headers, CORS misconfig, and auth gaps
-- Benchmark API endpoints for performance regressions
-- Write a detailed verification comment on the Linear ticket
-- Move the ticket to **Done** or back to **Todo** with a failure report
-
-This process is slow, context-switching-heavy, and inconsistent — and it doesn't scale when development is moving at AI speed. QA Shield automates the entire flow — directly from the Linear ticket page — via a floating panel with four independent actions: **Enrich Ticket**, **Verify Fix**, **Security Scan**, and **Benchmark**.
+> **AI writes the code. QA Shield makes sure it works.**
 
 ---
 
-## Architecture Overview
+## How It Works
 
-```
-Chrome Extension (content script on linear.app)
-        │
-        │  SSE streams (progress events)
-        ▼
-Next.js Backend (port 3000)
-  ├── POST /api/enrich       → AI ticket enrichment for developers
-  ├── POST /api/verify       → ticket-scoped fix verification
-  ├── POST /api/security/scan → OWASP-style security checks
-  └── POST /api/monitor/health → API benchmark + perf scoring
-        │
-        │  HTTP (DOM + API checks)
-        ▼
-Browser Worker (port 3099) — standalone Playwright process
-  └── POST /dom              → headless Chromium, real DOM inspection
-        │
-        ▼
-dev.creator.fun (staging) + dev.bep.creator.fun (API)
-```
+A floating panel injects into every Linear ticket. Four independent actions:
 
----
-
-## User Journey Loop
-
-```
-1. Open a Linear Ticket
-   User navigates to any ticket on linear.app/creatorfun.
-   QA Shield content script detects the ticket identifier (e.g. CRX-870)
-   and injects a floating panel in the bottom-right corner.
-
-2. Choose an Action
-   Four independent buttons appear in the panel:
-   - [Enrich Ticket]   → enriches the ticket with full context for developers
-   - [Verify Fix]      → confirms the ticket's reported issue is resolved
-   - [Security Scan]   → checks for OWASP-class vulnerabilities
-   - [Benchmark]       → measures API response times + scores performance
-
-3. SSE Stream Begins
-   Backend responds with a Server-Sent Events stream.
-   Progress events arrive step-by-step — the panel renders live updates
-   as each check completes, so the user sees real-time results instead
-   of waiting for a batch response.
-
-4. Enrich Ticket Flow (developer-facing)
-   Triggered by any developer who picks up a ticket and wants full clarity
-   before writing a single line of code.
-
-   Step 1 — Fetch ticket from Linear (title, description, labels, comments)
-   Step 2 — AI analysis: understands the issue in context of the platform
-   Step 3 — Generate enriched content:
-             • Clear problem summary (plain language, no ambiguity)
-             • Exact steps to reproduce on dev.creator.fun
-             • Expected vs actual behaviour
-             • Affected components / files / API endpoints
-             • Suggested fix approach with code-level hints
-             • Auto-generated test cases to verify the fix
-   Step 4 — Post enriched comment directly on the Linear ticket
-             (developer sees it the moment they open the ticket)
-
-   Result: developer hands the enriched ticket straight to an AI coding agent
-   (Cursor, Copilot, Claude Code) and ships the fix in one shot — no back-and-forth,
-   no guessing, no re-reading the same vague description three times.
-
-5. Verify Fix Flow (6 steps)
-   Step 1 — Fetch ticket from Linear API (title, description, labels)
-   Step 2 — Build verification plan (AI parses ticket → targeted checks)
-   Step 3 — Run API checks (curl staging endpoints, validate response shape)
-   Step 4 — Run DOM checks (browser worker navigates to live page, inspects elements)
-   Step 5 — Run transaction checks (if ticket involves trading/wallet logic)
-   Step 6 — Verdict: PASS → post comment + move to Done
-                      FAIL → post comment + move to Todo
-
-6. Security Scan Flow (3 steps)
-   Step 1 — Run OWASP checks (CORS, security headers, auth endpoints, key exposure)
-   Step 2 — Post security comment on the ticket
-   Step 3 — Create new Linear tickets for each finding (deduped against existing)
-             with Security + Bug labels; skips if identical ticket already exists
-
-7. Benchmark Flow (3 steps)
-   Step 1 — Hit core API endpoints (tokens, leaderboard, trades, search)
-   Step 2 — Score performance: <200ms = good, 200–500ms = warn, >500ms = fail
-   Step 3 — Post performance comment + create ticket if regressions found
-
-8. Iterate
-   Panel stays open between actions.
-   Collapse button shrinks it to a pill (⚡ QA Shield).
-   Click the pill to restore.
-   Each button is fully independent — security scan won't trigger verify,
-   benchmark won't post verify comments, etc.
-```
-
----
-
-## Security & Permissions Review
-
-| Permission | Usage | Justification |
+| Action | Who It's For | What It Does |
 |---|---|---|
-| `activeTab` | Read current Linear ticket URL + identifier | Required to detect ticket context on linear.app |
-| `scripting` | Inject floating panel + SSE consumer into Linear | Required for panel UI and stream handling |
-| `storage` | Persist backend URL config | Local-only, no sync/remote storage |
-| `host_permissions` (localhost:3000) | POST to local Next.js backend | Avoids CORS block; backend never exposed externally |
+| **Enrich Ticket** | Developer | Analyzes the ticket, posts structured context + fix hints |
+| **Verify Fix** | QA | Tests the fix against staging, moves ticket to Done or Todo |
+| **Security Scan** | QA / Dev | Runs OWASP checks, creates bug tickets for findings |
+| **Benchmark** | QA / Dev | Hits API endpoints, flags performance regressions |
 
-**Data Handling:**
-- All verification data flows locally: extension → localhost backend → staging API
-- No ticket content, API responses, or DOM data is sent to third-party servers
-- Anthropic API is called from the backend (server-side) only — API key never touches the extension
-- Linear API key stored in backend `.env.local` — not bundled in extension
-
-**Backend Security:**
-- Backend runs on `localhost:3000` only — not network-exposed
-- Browser worker runs on `127.0.0.1:3099` only — loopback, not LAN-accessible
-- Staging credentials (`georgecfun` password gate) handled in browser worker, not in extension
-
-**Playwright Browser Worker:**
-- Runs as a separate Node.js process (not inside Next.js webpack bundle)
-- Uses `chromium` headless with a persistent profile (`openclaw`)
-- Already authenticated as `zohaib@authornate.com` on dev.creator.fun
-- Password gate (`georgecfun`) handled automatically on first navigation
+Each action streams live progress via SSE — no waiting, results appear step by step.
 
 ---
 
-## Extension File Structure
+## Enrich Ticket
+
+**Purpose:** Give developers everything they need before writing a single line of code.
+
+A developer opens a ticket, clicks **Enrich**, and gets a comment posted with:
+
+- Plain-language summary of the problem
+- Exact steps to reproduce on dev.creator.fun
+- Expected vs actual behaviour
+- Affected components, files, and API endpoints
+- Suggested fix approach with code-level hints
+- Test cases to verify the fix is complete
+
+They hand the enriched ticket to an AI coding agent (Cursor, Copilot, Claude Code) and ship the fix in one pass — no back-and-forth, no re-reading vague descriptions.
+
+---
+
+## Verify Fix
+
+**Purpose:** Confirm a fix is real before marking it Done.
+
+Steps (streamed live):
+1. Fetch ticket from Linear
+2. Build verification plan — AI maps ticket to specific API + DOM checks
+3. Run API checks — hit staging endpoints, validate response shape
+4. Run DOM checks — headless browser inspects the live page
+5. Run transaction checks — if the ticket involves trading or wallet logic
+6. **PASS** → post verification comment + move to Done
+   **FAIL** → post failure details + move back to Todo
+
+---
+
+## Security Scan
+
+**Purpose:** Catch OWASP-class vulnerabilities before they reach production.
+
+Checks: CORS policy, security headers, auth endpoints, exposed API keys, open routes.
+
+- Posts a security comment on the ticket
+- Creates new Linear tickets for each finding (with Security + Bug labels)
+- Skips duplicates — never creates the same ticket twice
+
+---
+
+## Benchmark
+
+**Purpose:** Catch API performance regressions at the ticket level.
+
+Hits core endpoints: tokens, leaderboard, trades, search.
+
+- `< 200ms` → ✅ Good
+- `200–500ms` → ⚠️ Warn
+- `> 500ms` → ❌ Fail
+
+Posts a performance comment and creates a ticket if regressions are found.
+
+---
+
+## Architecture
 
 ```
-extension/
-├── manifest.json          # MV3, v0.3.0
-├── popup/
-│   ├── popup.html
-│   └── popup.js           # Config UI (backend URL)
-└── content/
-    ├── linear.js          # Main content script — panel, SSE, actions
-    └── linear.css         # Floating panel styles, live update UI
+Chrome Extension  →  Next.js Backend (port 3000)  →  Browser Worker (port 3099)
+                          │                                    │
+                   Linear + Anthropic API           Playwright (headless Chromium)
+                                                    dev.creator.fun / dev.bep.creator.fun
 ```
 
 ---
 
-## Backend File Structure
+## Permissions
 
-```
-backend/
-└── src/
-    ├── app/api/
-    │   ├── enrich/route.ts          # SSE — AI ticket enrichment for developers
-    │   ├── verify/route.ts          # SSE — fix verification (6 steps)
-    │   ├── security/scan/route.ts   # SSE — OWASP security scan (3 steps)
-    │   └── monitor/health/route.ts  # SSE — API benchmark (4 steps)
-    └── lib/
-        ├── linear.ts     # Linear GraphQL client (fetch, comment, move, create)
-        ├── ai.ts         # Anthropic prompts (verification plan, security, perf)
-        ├── verifier.ts   # Real checks — calls browser worker HTTP API
-        └── scanner.ts    # OWASP checks — headers, CORS, auth, key exposure
-```
+| Permission | Why |
+|---|---|
+| `activeTab` | Read ticket identifier from the Linear URL |
+| `scripting` | Inject the floating panel |
+| `storage` | Save backend URL setting locally |
+| `host_permissions` (localhost:3000) | Talk to the local backend without CORS issues |
 
----
-
-## AI Integration
-
-QA Shield uses Claude (Anthropic) at four points:
-
-| Step | Prompt | Purpose |
-|---|---|---|
-| Enrich — Step 2 | `buildEnrichmentPrompt()` | Full ticket analysis → reproduction steps, affected files, fix hints, test cases |
-| Verify — Step 2 | `buildVerificationOnlyPrompt()` | Parses ticket title+description → targeted API endpoints + DOM selectors to check |
-| Security — Step 2 | `buildSecurityPrompt()` | Summarises raw security findings into structured comment for Linear |
-| Benchmark — Step 2 | `buildPerformancePrompt()` | Interprets latency data + flags regressions with context |
-
-The AI **never makes pass/fail decisions on Verify** — all verdicts are based on deterministic API + DOM check results. On Enrich, AI is the primary engine — its output is the value. On Security and Benchmark, AI formats and contextualises deterministic scan results.
+**All data stays local.** Extension → localhost backend → staging API. Nothing goes to third-party servers. API keys live in `.env.local` on the backend only.
 
 ---
 
 ## Room for Improvement
 
-1. **Auto-detection of ticket type** — Currently `buildVerificationPlan()` uses regex on title/description to detect leaderboard, search, nav, trading tickets. A more robust classifier (keyword embedding or fine-tuned prompt) would handle ambiguous ticket titles more reliably.
-
-2. **Persistent browser session in worker** — The browser worker currently navigates fresh for each DOM check. Reusing an already-loaded page session (with cookies/auth intact) and only re-navigating when the URL changes would cut DOM check time significantly.
-
-3. **Screenshot diff on verify** — Capture a screenshot before and after a ticket fix and attach the diff image to the Linear comment, giving developers visual proof of the change rather than just pass/fail text.
-
-4. **Multi-ticket batch verify** — Allow verifying all In Review tickets in a single run from the Linear board view. The panel could process them sequentially, streaming results per ticket and posting comments automatically.
-
-5. **Test case persistence** — Store the verification plan (API endpoints + DOM selectors) generated for each ticket as a reusable test spec. When the same component is touched in a future ticket, the spec runs automatically as a regression check.
-
-6. **Slack integration for failures** — On FAIL verdict, automatically post to the `#dev` Slack channel with the ticket link, failure details, and assigned developer tagged — eliminating the need for manual escalation.
-
-7. **Coverage tracking** — Track which tickets have been QA-verified over time (by label, component, developer) and surface a coverage dashboard so the team can see QA throughput and recurring failure areas.
-
-8. **Load test trigger from panel** — Add a fourth button that triggers the `creator-stress` load testing suite (port 3001) against the staging API and streams results directly into the panel, giving a full performance picture alongside the functional verify.
+1. **Smarter ticket detection** — regex-based type detection breaks on ambiguous titles; a proper classifier would handle edge cases
+2. **Reuse browser session** — worker navigates fresh each time; reusing the loaded page would be faster
+3. **Screenshot diff** — attach before/after screenshots to the verify comment for visual proof
+4. **Batch verify** — verify all In Review tickets in one run from the board view
+5. **Persistent test specs** — save the verification plan per ticket as a reusable regression test
+6. **Auto-escalate failures to Slack** — post to `#dev` on FAIL with the dev tagged
+7. **Coverage dashboard** — track QA throughput and recurring failure patterns over time
+8. **Load test button** — trigger the `creator-stress` suite inline from the panel
