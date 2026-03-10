@@ -6,6 +6,16 @@
 
 ---
 
+## Core Idea
+
+The creator.fun codebase is being actively revamped with AI-assisted development. More code shipping faster means quality control becomes the bottleneck — and a manual QA process doesn't scale with AI-accelerated output.
+
+**QA Shield exists to close that gap.** It automates the QA layer so that as development velocity increases, quality assurance keeps pace — without adding headcount or manual toil. The goal is not just to catch bugs faster, but to build a feedback loop that makes the entire development process smarter: developers get instant, structured verification on every fix; security gaps are surfaced before they compound; performance regressions are caught at the ticket level, not after deployment.
+
+In short: **AI writes the code, QA Shield verifies it.**
+
+---
+
 ## Problem Statement
 
 When developers push fixes to Linear tickets and move them to **In Review**, a QA engineer must manually:
@@ -18,7 +28,7 @@ When developers push fixes to Linear tickets and move them to **In Review**, a Q
 - Write a detailed verification comment on the Linear ticket
 - Move the ticket to **Done** or back to **Todo** with a failure report
 
-This process is slow, context-switching-heavy, and inconsistent. QA Shield automates the entire flow — directly from the Linear ticket page — via a floating panel with three independent actions: **Verify Fix**, **Security Scan**, and **Benchmark**.
+This process is slow, context-switching-heavy, and inconsistent — and it doesn't scale when development is moving at AI speed. QA Shield automates the entire flow — directly from the Linear ticket page — via a floating panel with three independent actions: **Verify Fix**, **Security Scan**, and **Benchmark**.
 
 ---
 
