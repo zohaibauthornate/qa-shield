@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "QA Shield",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Automated QA lifecycle — ticket enrichment, verification, security scanning & performance benchmarking",
   "permissions": ["activeTab", "storage", "tabs"],
   "host_permissions": [

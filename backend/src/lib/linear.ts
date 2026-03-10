@@ -178,7 +178,7 @@ export async function findSimilarIssue(titleKeywords: string): Promise<LinearIss
 
   try {
     const data = await linearQuery(`
-      query SearchIssues($teamId: String!, $search: String!) {
+      query SearchIssues($teamId: ID!, $search: String!) {
         searchIssues(term: $search, filter: { team: { id: { eq: $teamId } } }, first: 5) {
           nodes {
             id identifier title description priority url createdAt updatedAt
@@ -248,4 +248,5 @@ export const LABELS = {
   QA_RECHECK: 'c7199040-3fb2-441a-bda1-07012e5d67a4',
   FRONTEND: 'f09ae1f9-f0dc-4229-9958-4929296416ce',
   BACKEND: 'fcefe1f0-859f-4076-b6ab-10ae1b42c1b9',
+  SECURITY: '84a10ad3-66da-490a-8e55-9d4f494890d6',
 } as const;

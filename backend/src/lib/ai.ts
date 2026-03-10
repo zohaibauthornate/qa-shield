@@ -314,6 +314,68 @@ CRITICAL RULES:
 `;
 }
 
+// ============ Verification-Only Prompt (no security/perf) ============
+
+export function buildVerificationOnlyPrompt(
+  issue: LinearIssue,
+  enrichment: TicketEnrichment | null,
+): string {
+  const testCases = enrichment?.testCases?.map(tc =>
+    `${tc.id}: ${tc.title} [${tc.priority}]\nSteps: ${tc.steps.join(' → ')}\nExpected: ${tc.expected}`
+  ).join('\n\n') || 'No test cases generated';
+
+  return `${PLATFORM_CONTEXT}
+
+You are verifying whether the fix for this ticket resolves the reported issue.
+Focus ONLY on the ticket scope — does the fix meet the requirements described in the ticket?
+
+TICKET: ${issue.identifier}
+TITLE: ${issue.title}
+DESCRIPTION:
+${issue.description || 'No description'}
+
+STATE: ${issue.state.name}
+ASSIGNEE: ${issue.assignee?.name || 'Unassigned'}
+
+EXISTING COMMENTS:
+${issue.comments.nodes.map(c => `[${c.user.name}]: ${c.body.substring(0, 300)}`).join('\n') || 'None'}
+
+TEST CASES TO VERIFY:
+${testCases}
+
+Produce a JSON object with this EXACT structure:
+{
+  "overallVerdict": "pass|fail|partial",
+  "verdictSummary": "1-2 sentence summary — does THE FIX meet the ticket requirements?",
+  "fixVerification": {
+    "status": "pass|fail|partial|cannot_verify",
+    "summary": "What was verified",
+    "stepsExecuted": [
+      { "name": "What was checked", "status": "pass|fail|skip|warn", "details": "Evidence" }
+    ],
+    "passed": ["Things that passed"],
+    "failed": [{ "test": "What failed", "reason": "Why" }],
+    "cannotTest": [{ "area": "What couldn't be tested", "constraint": "Why" }]
+  },
+  "sanityChecks": {
+    "status": "pass|fail|partial",
+    "checks": [{ "name": "Check name", "status": "pass|fail|warn", "details": "What was found" }]
+  },
+  "regressionRisk": {
+    "level": "low|medium|high",
+    "areas": ["Areas to watch"],
+    "recommendation": "What to monitor"
+  },
+  "recommendations": ["Specific recommendations"]
+}
+
+RULES:
+- Only evaluate whether the FIX addresses the TICKET requirements. Nothing else.
+- Be honest: if you cannot verify without browser/wallet interaction, say "cannot_verify".
+- Include specific evidence, not generic statements.
+`;
+}
+
 // ============ Format: Enrichment Comment ============
 
 export function formatEnrichmentAsComment(enrichment: TicketEnrichment): string {

@@ -1,6 +1,6 @@
 /**
- * QA Shield v0.2 — Linear Content Script
- * Multi-step loading, precision enrichment, clean verification
+ * QA Shield v0.3 — Linear Content Script
+ * SSE streaming for real-time updates, ticket ID tracking, security labels
  */
 
 const QA_SHIELD_API = 'http://localhost:3000';
@@ -23,7 +23,7 @@ function createSidebar() {
     <div class="qs-header">
       <span class="qs-logo">🛡️</span>
       <span class="qs-title">QA Shield</span>
-      <span class="qs-version">v0.2</span>
+      <span class="qs-version">v0.3</span>
       <button class="qs-close" id="qs-close-btn">×</button>
     </div>
     <div class="qs-content" id="qs-content">
@@ -35,6 +35,7 @@ function createSidebar() {
           <div class="qs-progress-fill" id="qs-progress-fill"></div>
         </div>
         <div class="qs-steps" id="qs-steps"></div>
+        <div class="qs-live-updates" id="qs-live-updates"></div>
         <div class="qs-elapsed" id="qs-elapsed"></div>
       </div>
       <div class="qs-results" id="qs-results" style="display:none"></div>
@@ -49,9 +50,21 @@ function createSidebar() {
 
   document.body.appendChild(sidebar);
 
-  document.getElementById('qs-close-btn').addEventListener('click', () => {
-    sidebar.classList.toggle('qs-collapsed');
+  // Minimize/restore on close button click
+  document.getElementById('qs-close-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    sidebar.classList.add('qs-collapsed');
   });
+
+  // Restore on clicking the collapsed pill
+  sidebar.addEventListener('click', (e) => {
+    if (sidebar.classList.contains('qs-collapsed')) {
+      sidebar.classList.remove('qs-collapsed');
+    }
+  });
+
+  // Drag support — move the panel by dragging the header
+  makeDraggable(sidebar, sidebar.querySelector('.qs-header'));
 
   document.getElementById('qs-enrich-btn').addEventListener('click', enrichTicket);
   document.getElementById('qs-verify-btn').addEventListener('click', verifyFix);
@@ -81,9 +94,12 @@ function showProgress(steps) {
     </div>
   `).join('');
 
+  // Clear live updates area
+  const liveUpdates = document.getElementById('qs-live-updates');
+  liveUpdates.innerHTML = '';
+
   document.getElementById('qs-progress-fill').style.width = '0%';
 
-  // Start elapsed timer
   progressStart = Date.now();
   const elapsedEl = document.getElementById('qs-elapsed');
   clearInterval(progressTimer);
@@ -92,21 +108,23 @@ function showProgress(steps) {
     elapsedEl.textContent = `⏱️ ${elapsed}s elapsed`;
   }, 1000);
 
-  // Disable buttons during operation
   setButtonsDisabled(true);
 }
 
-function updateStep(index, status) {
+function updateStep(index, status, label) {
   const step = document.getElementById(`qs-step-${index}`);
   if (!step) return;
 
   step.dataset.status = status;
   const icon = step.querySelector('.qs-step-icon');
+  const text = step.querySelector('.qs-step-text');
 
   if (status === 'active') icon.textContent = '◉';
   else if (status === 'done') icon.textContent = '✓';
   else if (status === 'error') icon.textContent = '✗';
   else icon.textContent = '○';
+
+  if (label) text.textContent = label;
 
   // Update progress bar
   const allSteps = document.querySelectorAll('.qs-step');
@@ -115,6 +133,15 @@ function updateStep(index, status) {
   const total = allSteps.length;
   const pct = Math.round(((doneCount + activeCount * 0.5) / total) * 100);
   document.getElementById('qs-progress-fill').style.width = `${pct}%`;
+}
+
+function addLiveUpdate(html) {
+  const el = document.getElementById('qs-live-updates');
+  const item = document.createElement('div');
+  item.className = 'qs-live-item';
+  item.innerHTML = html;
+  el.appendChild(item);
+  el.scrollTop = el.scrollHeight;
 }
 
 function finishProgress() {
@@ -131,7 +158,163 @@ function setButtonsDisabled(disabled) {
   });
 }
 
-// ============ API Calls ============
+// ============ Generic SSE Stream Consumer ============
+
+async function consumeSSEStream(url, method, body, steps, onComplete) {
+  showProgress(steps);
+
+  const finalData = { existingTickets: [], newTickets: [], result: null };
+
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      let currentEvent = null;
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          currentEvent = line.slice(7).trim();
+        } else if (line.startsWith('data: ') && currentEvent) {
+          try {
+            const data = JSON.parse(line.slice(6));
+
+            switch (currentEvent) {
+              case 'step':
+                updateStep(data.step, data.status, data.label || data.detail);
+                break;
+              case 'linear_update':
+                addLiveUpdate(`<span class="qs-live-badge qs-live-${data.type}">📝 Linear</span> ${data.message}`);
+                break;
+              case 'check': {
+                const icon = data.status === 'pass' ? '✅' : data.status === 'fail' ? '❌' : '⚠️';
+                addLiveUpdate(`${icon} <strong>${data.name}</strong> <span class="qs-muted">${(data.details || '').substring(0, 60)}</span>`);
+                break;
+              }
+              case 'plan':
+                addLiveUpdate(`<span class="qs-live-badge qs-live-verification">📋 Plan</span> ${data.reasoning || ''}`);
+                break;
+              case 'existing_ticket':
+                finalData.existingTickets.push(data);
+                addLiveUpdate(
+                  `<span class="qs-live-badge qs-live-existing">📋 Exists</span> ` +
+                  `<a href="${data.url}" target="_blank" class="qs-ticket-link">${data.identifier}</a> — ${data.title}`
+                );
+                break;
+              case 'new_ticket':
+                finalData.newTickets.push(data);
+                addLiveUpdate(
+                  `<span class="qs-live-badge qs-live-new">🆕 Created</span> ` +
+                  `<a href="${data.url}" target="_blank" class="qs-ticket-link">${data.identifier}</a> — ${data.title}`
+                );
+                break;
+              case 'complete':
+                finalData.result = data;
+                break;
+              case 'error':
+                showError(data.message);
+                break;
+            }
+          } catch (e) {
+            console.warn('[QA Shield] SSE parse error:', e);
+          }
+          currentEvent = null;
+        }
+      }
+    }
+
+    finishProgress();
+
+    if (finalData.result) {
+      onComplete(finalData);
+    } else {
+      showError('No data received from server');
+    }
+  } catch (err) {
+    finishProgress();
+    showError(`Failed: ${err.message}`);
+  }
+}
+
+// ============ Verify Fix (pure ticket scope — no security/perf) ============
+
+async function verifyFix() {
+  const identifier = getIssueIdentifier();
+  if (!identifier) return showError('Could not detect ticket ID');
+
+  await consumeSSEStream(
+    `${QA_SHIELD_API}/api/verify`,
+    'POST',
+    { identifier, postComment: true },
+    [
+      'Fetching ticket...',
+      'Building verification plan...',
+      'Running API checks...',
+      'Inspecting DOM...',
+      'Testing transactions...',
+      'Computing verdict...',
+    ],
+    (finalData) => {
+      showVerifyFixResults(finalData.result);
+    }
+  );
+}
+
+// ============ Security Scan (standalone) ============
+
+async function runSecurityScan() {
+  const identifier = getIssueIdentifier();
+
+  await consumeSSEStream(
+    `${QA_SHIELD_API}/api/security/scan`,
+    'POST',
+    { identifier, postComment: !!identifier },
+    [
+      'Scanning API endpoints...',
+      'Posting to Linear...',
+      'Checking for duplicate tickets...',
+    ],
+    (finalData) => {
+      showSecurityResults(finalData.result, finalData.existingTickets, finalData.newTickets);
+    }
+  );
+}
+
+// ============ Performance Benchmark (standalone) ============
+
+async function runBenchmark() {
+  const identifier = getIssueIdentifier();
+
+  await consumeSSEStream(
+    `${QA_SHIELD_API}/api/monitor/health`,
+    'POST',
+    { identifier, postComment: !!identifier },
+    [
+      'Benchmarking creator.fun...',
+      'Benchmarking competitors...',
+      'Posting to Linear...',
+      'Checking for performance issues...',
+    ],
+    (finalData) => {
+      showBenchmarkResults(finalData.result, finalData.existingTickets, finalData.newTickets);
+    }
+  );
+}
+
+// ============ Enrich Ticket (non-streaming) ============
 
 async function enrichTicket() {
   const identifier = getIssueIdentifier();
@@ -147,7 +330,6 @@ async function enrichTicket() {
 
   try {
     updateStep(0, 'active');
-    // Small delay to show the step transition
     await sleep(300);
     updateStep(0, 'done');
 
@@ -175,111 +357,6 @@ async function enrichTicket() {
   } catch (err) {
     finishProgress();
     showError(`Enrichment failed: ${err.message}`);
-  }
-}
-
-async function verifyFix() {
-  const identifier = getIssueIdentifier();
-  if (!identifier) return showError('Could not detect ticket ID');
-
-  const steps = [
-    'Fetching ticket details...',
-    'Running fix verification...',
-    'Scanning security...',
-    'Benchmarking performance...',
-    'Posting results to Linear...',
-  ];
-  showProgress(steps);
-
-  try {
-    updateStep(0, 'active');
-    await sleep(300);
-    updateStep(0, 'done');
-
-    updateStep(1, 'active');
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 180000);
-
-    const res = await fetch(`${QA_SHIELD_API}/api/verify`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier, postComment: true }),
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeout);
-    updateStep(1, 'done');
-    updateStep(2, 'done');
-    updateStep(3, 'done');
-    updateStep(4, 'active');
-    await sleep(200);
-
-    const data = await res.json();
-    if (!data.success) throw new Error(data.error);
-
-    updateStep(4, 'done');
-    finishProgress();
-
-    showVerificationResults(data);
-  } catch (err) {
-    finishProgress();
-    if (err.name === 'AbortError') {
-      showError('Verification timed out (>3 min). Check the Linear ticket for partial results.');
-    } else {
-      showError(`Verification failed: ${err.message}`);
-    }
-  }
-}
-
-async function runSecurityScan() {
-  const identifier = getIssueIdentifier();
-  const steps = ['Scanning API endpoints...', 'Analyzing results...', 'Posting to Linear...'];
-  showProgress(steps);
-
-  try {
-    updateStep(0, 'active');
-    const res = await fetch(`${QA_SHIELD_API}/api/security/scan`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier, postComment: true }),
-    });
-
-    updateStep(0, 'done');
-    updateStep(1, 'active');
-    const data = await res.json();
-    if (!data.success) throw new Error(data.error);
-
-    updateStep(1, 'done');
-    updateStep(2, 'done');
-    finishProgress();
-
-    showSecurityResults(data);
-  } catch (err) {
-    finishProgress();
-    showError(`Security scan failed: ${err.message}`);
-  }
-}
-
-async function runBenchmark() {
-  const steps = ['Measuring creator.fun...', 'Measuring competitors...', 'Comparing results...'];
-  showProgress(steps);
-
-  try {
-    updateStep(0, 'active');
-    const res = await fetch(`${QA_SHIELD_API}/api/monitor/health?mode=benchmark`);
-
-    updateStep(0, 'done');
-    updateStep(1, 'done');
-    updateStep(2, 'active');
-    const data = await res.json();
-
-    updateStep(2, 'done');
-    finishProgress();
-
-    showBenchmarkResults(data);
-  } catch (err) {
-    finishProgress();
-    showError(`Benchmark failed: ${err.message}`);
   }
 }
 
@@ -388,161 +465,253 @@ function showEnrichmentResults(enrichment, commentPosted) {
   `;
 }
 
-function showVerificationResults(data) {
+// ── Verify Fix Results (real browser + API testing) ──
+
+function showVerifyFixResults(data) {
   const progress = document.getElementById('qs-progress');
   const results = document.getElementById('qs-results');
   progress.style.display = 'none';
   results.style.display = 'block';
 
-  const v = data.verification;
-  if (!v) {
+  if (!data) {
     results.innerHTML = '<div class="qs-error">No verification data returned</div>';
     return;
   }
 
-  const verdictIcon = v.overallVerdict === 'pass' ? '✅' : v.overallVerdict === 'fail' ? '❌' : '⚠️';
-  const verdictClass = v.overallVerdict === 'pass' ? 'pass' : v.overallVerdict === 'fail' ? 'fail' : 'partial';
-  const verdictText = v.overallVerdict === 'pass' ? 'VERIFICATION PASSED' : v.overallVerdict === 'fail' ? 'VERIFICATION FAILED' : 'PARTIAL VERIFICATION';
+  const verdict = data.verdict || 'partial';
+  const verdictIcon = verdict === 'pass' ? '✅' : verdict === 'fail' ? '❌' : '⚠️';
+  const verdictClass = verdict === 'pass' ? 'pass' : verdict === 'fail' ? 'fail' : 'partial';
+  const verdictText = verdict === 'pass' ? 'PASSED → Done' : verdict === 'fail' ? 'FAILED' : 'PARTIAL';
+  const s = data.summary || {};
 
   let html = `
     <div class="qs-verdict-banner qs-verdict-${verdictClass}">
       <span class="qs-verdict-icon">${verdictIcon}</span>
       <span class="qs-verdict-label">${verdictText}</span>
     </div>
-    <p class="qs-verdict-summary">${v.verdictSummary || ''}</p>
+    <div class="qs-summary-grid" style="margin:8px 0">
+      <div class="qs-summary-item"><span class="qs-big-num">${s.passed || 0}</span><span>Passed</span></div>
+      <div class="qs-summary-item"><span class="qs-big-num qs-red">${s.failed || 0}</span><span>Failed</span></div>
+      <div class="qs-summary-item"><span class="qs-big-num qs-yellow">${s.warned || 0}</span><span>Warn</span></div>
+    </div>
   `;
 
-  // Fix Verification
-  const fv = v.fixVerification || {};
-  if (fv.stepsExecuted && fv.stepsExecuted.length > 0) {
-    html += `<div class="qs-section"><h3>📋 Fix Verification</h3>`;
-    fv.stepsExecuted.forEach(s => {
-      const icon = s.status === 'pass' ? '✅' : s.status === 'fail' ? '❌' : s.status === 'skip' ? '⏭️' : '⚠️';
-      html += `<div class="qs-test-case"><strong>${icon} ${s.name}</strong><p class="qs-hint">${s.details || ''}</p></div>`;
-    });
-    html += `</div>`;
+  if (data.movedToDone) {
+    html += `<div class="qs-success" style="margin-bottom:12px">✅ <strong>${data.identifier}</strong> moved to Done</div>`;
   }
 
-  // Passed
-  if (fv.passed && fv.passed.length > 0) {
-    html += `<div class="qs-section"><h3>✅ Passed</h3>`;
-    fv.passed.forEach(p => { html += `<div class="qs-impact-item">✅ ${p}</div>`; });
-    html += `</div>`;
-  }
+  // Group checks by status
+  const checks = data.checks || [];
+  const passed = checks.filter(c => c.status === 'pass');
+  const failed = checks.filter(c => c.status === 'fail');
+  const warned = checks.filter(c => c.status === 'warn');
 
-  // Failed
-  if (fv.failed && fv.failed.length > 0) {
-    html += `<div class="qs-section"><h3>❌ Failed</h3>`;
-    fv.failed.forEach(f => {
+  if (failed.length > 0) {
+    html += `<div class="qs-section"><h3>❌ Failed (${failed.length})</h3>`;
+    failed.forEach(c => {
       html += `<div class="qs-test-case" style="border-left:3px solid #ef4444;padding-left:8px">
-        <strong>${f.test}</strong><p class="qs-hint" style="color:#ef4444">→ ${f.reason}</p></div>`;
+        <strong>${c.name}</strong><p class="qs-hint" style="color:#ef4444">${c.details || ''}</p></div>`;
     });
     html += `</div>`;
   }
 
-  // Cannot Test
-  if (fv.cannotTest && fv.cannotTest.length > 0) {
-    html += `<div class="qs-section"><h3>🔒 Cannot Test</h3>`;
-    fv.cannotTest.forEach(c => {
-      html += `<div class="qs-impact-item">🔒 <strong>${c.area}</strong>: ${c.constraint}</div>`;
+  if (passed.length > 0) {
+    html += `<div class="qs-section"><h3>✅ Passed (${passed.length})</h3>`;
+    passed.forEach(c => {
+      html += `<div class="qs-impact-item">✅ <strong>${c.name}</strong> — ${(c.details || '').substring(0, 80)}</div>`;
     });
     html += `</div>`;
   }
 
-  // Sanity Checks
-  const sc = v.sanityChecks;
-  if (sc && sc.checks && sc.checks.length > 0) {
-    html += `<div class="qs-section"><h3>🧪 Sanity Checks</h3>`;
-    sc.checks.forEach(check => {
-      const icon = check.status === 'pass' ? '✅' : check.status === 'fail' ? '❌' : '⚠️';
-      html += `<div class="qs-impact-item">${icon} <strong>${check.name}</strong>: ${check.details}</div>`;
+  if (warned.length > 0) {
+    html += `<div class="qs-section"><h3>⚠️ Warnings (${warned.length})</h3>`;
+    warned.forEach(c => {
+      html += `<div class="qs-impact-item">⚠️ <strong>${c.name}</strong> — ${c.details || ''}</div>`;
     });
     html += `</div>`;
   }
 
-  // Regression Risk
-  if (v.regressionRisk) {
-    const riskLevel = v.regressionRisk.level || 'low';
-    const riskColor = riskLevel === 'high' ? '#ef4444' : riskLevel === 'medium' ? '#eab308' : '#22c55e';
-    html += `<div class="qs-section"><h3>🎯 Regression Risk: <span style="color:${riskColor}">${riskLevel.toUpperCase()}</span></h3>`;
-    html += `<p class="qs-hint">${v.regressionRisk.recommendation || ''}</p></div>`;
-  }
-
-  // Security & Performance summaries (compact since separate comments exist)
-  const sec = data.security?.summary || {};
-  html += `<div class="qs-section qs-compact">
-    <span>🔒 Security: ${sec.passed || 0}✅ ${sec.warnings || 0}⚠️ ${sec.failed || 0}❌</span>
-    <span class="qs-muted"> · ⚡ Performance: ${data.benchmark?.ours?.responseTime || 'N/A'}ms</span>
-  </div>`;
-
-  // Posted comments
-  if (data.postedComments && data.postedComments.length > 0) {
-    html += `<div class="qs-success">✅ ${data.postedComments.length} comments posted to Linear</div>`;
-  }
-
+  html += `<div class="qs-success">✅ Real verification posted to Linear (browser + API)</div>`;
   results.innerHTML = html;
 }
 
-function showSecurityResults(data) {
+// ── Security Results (with ticket tracking) ──
+
+function showSecurityResults(data, existingTickets, newTickets) {
   const progress = document.getElementById('qs-progress');
   const results = document.getElementById('qs-results');
   progress.style.display = 'none';
   results.style.display = 'block';
 
-  results.innerHTML = `
+  const s = data.summary || {};
+  let html = `
     <div class="qs-section">
       <h3>🔒 Security Scan Results</h3>
       <div class="qs-summary-grid">
-        <div class="qs-summary-item"><span class="qs-big-num">${data.summary.passed}</span><span>Passed</span></div>
-        <div class="qs-summary-item"><span class="qs-big-num qs-yellow">${data.summary.warnings}</span><span>Warnings</span></div>
-        <div class="qs-summary-item"><span class="qs-big-num qs-red">${data.summary.failed}</span><span>Failed</span></div>
+        <div class="qs-summary-item"><span class="qs-big-num">${s.passed || 0}</span><span>Passed</span></div>
+        <div class="qs-summary-item"><span class="qs-big-num qs-yellow">${s.warnings || 0}</span><span>Warnings</span></div>
+        <div class="qs-summary-item"><span class="qs-big-num qs-red">${s.failed || 0}</span><span>Failed</span></div>
       </div>
     </div>
-    ${data.results.map(r => `
-      <div class="qs-section qs-scan-${r.overallStatus}">
-        <h4>${r.overallStatus === 'pass' ? '✅' : r.overallStatus === 'fail' ? '❌' : '⚠️'} ${r.endpoint.split('/api')[1] || r.endpoint}</h4>
-        ${r.checks.map(c => `
-          <div class="qs-check-row">
-            <span class="qs-check-type">${c.type}</span>
-            <span class="qs-check-status qs-status-${c.status}">${c.status}</span>
-            <span class="qs-check-detail">${c.details}</span>
-          </div>
-        `).join('')}
-      </div>
-    `).join('')}
   `;
+
+  if (data.results) {
+    data.results.forEach(r => {
+      const icon = r.overallStatus === 'pass' ? '✅' : r.overallStatus === 'fail' ? '❌' : '⚠️';
+      const ep = r.endpoint.split('/api')[1] || r.endpoint;
+      html += `<div class="qs-section qs-scan-${r.overallStatus}"><h4>${icon} /api${ep}</h4>`;
+      r.checks.forEach(c => {
+        html += `<div class="qs-check-row">
+          <span class="qs-check-type">${c.type}</span>
+          <span class="qs-check-status qs-status-${c.status}">${c.status}</span>
+          <span class="qs-check-detail">${c.details}</span>
+        </div>`;
+      });
+      html += `</div>`;
+    });
+  }
+
+  html += renderTicketSection(existingTickets, newTickets, '🔒 Security');
+  html += `<div class="qs-success">✅ Security comment posted to Linear</div>`;
+  results.innerHTML = html;
 }
 
-function showBenchmarkResults(data) {
+// ── Benchmark Results (with ticket tracking) ──
+
+function showBenchmarkResults(data, existingTickets, newTickets) {
   const progress = document.getElementById('qs-progress');
   const results = document.getElementById('qs-results');
   progress.style.display = 'none';
   results.style.display = 'block';
 
-  results.innerHTML = `
+  const b = data.benchmark || {};
+  let html = `
     <div class="qs-section">
       <h3>⚡ Performance Benchmark</h3>
-      ${data.frontend ? `
-        <div class="qs-benchmark-card qs-verdict-${data.frontend.verdict}">
-          <h4>Frontend vs Competitors</h4>
-          <div class="qs-verdict">${data.frontend.verdict.toUpperCase()}</div>
-          <p>${data.frontend.delta}</p>
-          <p>Our response: ${data.frontend.ours?.responseTime || 'N/A'}ms | TTFB: ${data.frontend.ours?.ttfb || 'N/A'}ms</p>
-          ${data.frontend.competitors?.map(c => `
-            <p>${c.name}: ${c.result.responseTime}ms | TTFB: ${c.result.ttfb}ms</p>
-          `).join('') || ''}
-        </div>
-      ` : ''}
-      <h4>API Endpoints</h4>
-      ${data.api?.map(a => `
+      <div class="qs-benchmark-card">
+        <div class="qs-benchmark-row"><strong>Platform</strong><strong>Response</strong><strong>TTFB</strong></div>
         <div class="qs-benchmark-row">
-          <span>${a.name}</span>
-          <span>${a.result.responseTime}ms</span>
-          <span class="qs-status-${a.result.statusCode < 400 ? 'pass' : 'fail'}">${a.result.statusCode}</span>
+          <span>🟢 creator.fun</span>
+          <span>${b.ours?.responseTime || 'N/A'}ms</span>
+          <span>${b.ours?.ttfb || 'N/A'}ms</span>
         </div>
-      `).join('') || '<p>No API benchmark data</p>'}
+        <div class="qs-benchmark-row">
+          <span>axiom.trade</span>
+          <span>${b.axiom?.responseTime || 'N/A'}ms</span>
+          <span>${b.axiom?.ttfb || 'N/A'}ms</span>
+        </div>
+        <div class="qs-benchmark-row">
+          <span>pump.fun</span>
+          <span>${b.pump?.responseTime || 'N/A'}ms</span>
+          <span>${b.pump?.ttfb || 'N/A'}ms</span>
+        </div>
+      </div>
     </div>
   `;
+
+  html += renderTicketSection(existingTickets, newTickets, '⚡ Performance');
+  html += `<div class="qs-success">✅ Performance comment posted to Linear</div>`;
+  results.innerHTML = html;
+}
+
+// ── Shared: Render ticket tracking section ──
+
+function renderTicketSection(existingTickets, newTickets, label) {
+  if (!existingTickets?.length && !newTickets?.length) return '';
+
+  let html = `<div class="qs-section"><h3>🎫 ${label} Tickets</h3>`;
+
+  if (existingTickets?.length > 0) {
+    html += `<div class="qs-ticket-group"><h4>📋 Already Reported</h4>`;
+    existingTickets.forEach(t => {
+      html += `
+        <div class="qs-ticket-row qs-ticket-existing">
+          <a href="${t.url}" target="_blank" class="qs-ticket-id">${t.identifier}</a>
+          <span class="qs-ticket-title">${t.title}</span>
+          <span class="qs-ticket-match">↳ ${t.matchedFor || ''}</span>
+        </div>`;
+    });
+    html += `</div>`;
+  }
+
+  if (newTickets?.length > 0) {
+    html += `<div class="qs-ticket-group"><h4>🆕 Newly Created</h4>`;
+    newTickets.forEach(t => {
+      html += `
+        <div class="qs-ticket-row qs-ticket-new">
+          <a href="${t.url}" target="_blank" class="qs-ticket-id">${t.identifier}</a>
+          <span class="qs-ticket-title">${t.title}</span>
+          <span class="qs-ticket-label">${label.includes('Security') ? '🔒 Security' : '⚡ Performance'}</span>
+        </div>`;
+    });
+    html += `</div>`;
+  }
+
+  html += `</div>`;
+  return html;
+}
+
+// ============ Drag Support (GPU-accelerated) ============
+
+function makeDraggable(element, handle) {
+  let startX, startY, origX, origY, raf;
+  let moved = false;
+
+  // Use transform for GPU-accelerated movement
+  element.style.willChange = 'transform';
+
+  handle.addEventListener('mousedown', (e) => {
+    if (element.classList.contains('qs-collapsed')) return;
+    if (e.target.closest('.qs-close')) return;
+
+    moved = false;
+    startX = e.clientX;
+    startY = e.clientY;
+
+    const rect = element.getBoundingClientRect();
+    origX = rect.left;
+    origY = rect.top;
+
+    // Switch to absolute positioning on first drag
+    element.style.right = 'auto';
+    element.style.bottom = 'auto';
+    element.style.left = origX + 'px';
+    element.style.top = origY + 'px';
+
+    handle.style.cursor = 'grabbing';
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    e.preventDefault();
+  });
+
+  function onMove(e) {
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    if (!moved && Math.abs(dx) + Math.abs(dy) < 3) return;
+    moved = true;
+    cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(() => {
+      element.style.transform = `translate3d(${dx}px, ${dy}px, 0)`;
+    });
+  }
+
+  function onUp(e) {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    cancelAnimationFrame(raf);
+    handle.style.cursor = 'grab';
+
+    if (moved) {
+      // Bake the transform into left/top
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      const newX = Math.max(0, Math.min(origX + dx, window.innerWidth - 100));
+      const newY = Math.max(0, Math.min(origY + dy, window.innerHeight - 60));
+      element.style.left = newX + 'px';
+      element.style.top = newY + 'px';
+      element.style.transform = '';
+    }
+  }
 }
 
 // ============ Initialize ============
@@ -551,7 +720,7 @@ function init() {
   const identifier = getIssueIdentifier();
   if (identifier) {
     createSidebar();
-    console.log(`[QA Shield] 🛡️ v0.2 Active on ${identifier}`);
+    console.log(`[QA Shield] 🛡️ v0.3 Active on ${identifier}`);
   }
 }
 
