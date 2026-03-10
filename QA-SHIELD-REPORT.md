@@ -12,7 +12,7 @@ The creator.fun codebase is being actively revamped with AI-assisted development
 
 **QA Shield exists to close that gap.** It automates the QA layer so that as development velocity increases, quality assurance keeps pace — without adding headcount or manual toil. The goal is not just to catch bugs faster, but to build a feedback loop that makes the entire development process smarter: developers get instant, structured verification on every fix; security gaps are surfaced before they compound; performance regressions are caught at the ticket level, not after deployment.
 
-In short: **AI writes the code, QA Shield verifies it.**
+In short: **AI writes the code, QA Shield enriches the ticket, verifies the fix, and closes the loop.**
 
 ---
 
@@ -28,7 +28,7 @@ When developers push fixes to Linear tickets and move them to **In Review**, a Q
 - Write a detailed verification comment on the Linear ticket
 - Move the ticket to **Done** or back to **Todo** with a failure report
 
-This process is slow, context-switching-heavy, and inconsistent — and it doesn't scale when development is moving at AI speed. QA Shield automates the entire flow — directly from the Linear ticket page — via a floating panel with three independent actions: **Verify Fix**, **Security Scan**, and **Benchmark**.
+This process is slow, context-switching-heavy, and inconsistent — and it doesn't scale when development is moving at AI speed. QA Shield automates the entire flow — directly from the Linear ticket page — via a floating panel with four independent actions: **Enrich Ticket**, **Verify Fix**, **Security Scan**, and **Benchmark**.
 
 ---
 
@@ -40,6 +40,7 @@ Chrome Extension (content script on linear.app)
         │  SSE streams (progress events)
         ▼
 Next.js Backend (port 3000)
+  ├── POST /api/enrich       → AI ticket enrichment for developers
   ├── POST /api/verify       → ticket-scoped fix verification
   ├── POST /api/security/scan → OWASP-style security checks
   └── POST /api/monitor/health → API benchmark + perf scoring
@@ -64,7 +65,8 @@ dev.creator.fun (staging) + dev.bep.creator.fun (API)
    and injects a floating panel in the bottom-right corner.
 
 2. Choose an Action
-   Three independent buttons appear in the panel:
+   Four independent buttons appear in the panel:
+   - [Enrich Ticket]   → enriches the ticket with full context for developers
    - [Verify Fix]      → confirms the ticket's reported issue is resolved
    - [Security Scan]   → checks for OWASP-class vulnerabilities
    - [Benchmark]       → measures API response times + scores performance
@@ -75,7 +77,27 @@ dev.creator.fun (staging) + dev.bep.creator.fun (API)
    as each check completes, so the user sees real-time results instead
    of waiting for a batch response.
 
-4. Verify Fix Flow (6 steps)
+4. Enrich Ticket Flow (developer-facing)
+   Triggered by any developer who picks up a ticket and wants full clarity
+   before writing a single line of code.
+
+   Step 1 — Fetch ticket from Linear (title, description, labels, comments)
+   Step 2 — AI analysis: understands the issue in context of the platform
+   Step 3 — Generate enriched content:
+             • Clear problem summary (plain language, no ambiguity)
+             • Exact steps to reproduce on dev.creator.fun
+             • Expected vs actual behaviour
+             • Affected components / files / API endpoints
+             • Suggested fix approach with code-level hints
+             • Auto-generated test cases to verify the fix
+   Step 4 — Post enriched comment directly on the Linear ticket
+             (developer sees it the moment they open the ticket)
+
+   Result: developer hands the enriched ticket straight to an AI coding agent
+   (Cursor, Copilot, Claude Code) and ships the fix in one shot — no back-and-forth,
+   no guessing, no re-reading the same vague description three times.
+
+5. Verify Fix Flow (6 steps)
    Step 1 — Fetch ticket from Linear API (title, description, labels)
    Step 2 — Build verification plan (AI parses ticket → targeted checks)
    Step 3 — Run API checks (curl staging endpoints, validate response shape)
@@ -84,18 +106,18 @@ dev.creator.fun (staging) + dev.bep.creator.fun (API)
    Step 6 — Verdict: PASS → post comment + move to Done
                       FAIL → post comment + move to Todo
 
-5. Security Scan Flow (3 steps)
+6. Security Scan Flow (3 steps)
    Step 1 — Run OWASP checks (CORS, security headers, auth endpoints, key exposure)
    Step 2 — Post security comment on the ticket
    Step 3 — Create new Linear tickets for each finding (deduped against existing)
              with Security + Bug labels; skips if identical ticket already exists
 
-6. Benchmark Flow (3 steps)
+7. Benchmark Flow (3 steps)
    Step 1 — Hit core API endpoints (tokens, leaderboard, trades, search)
    Step 2 — Score performance: <200ms = good, 200–500ms = warn, >500ms = fail
    Step 3 — Post performance comment + create ticket if regressions found
 
-7. Iterate
+8. Iterate
    Panel stays open between actions.
    Collapse button shrinks it to a pill (⚡ QA Shield).
    Click the pill to restore.
@@ -154,6 +176,7 @@ extension/
 backend/
 └── src/
     ├── app/api/
+    │   ├── enrich/route.ts          # SSE — AI ticket enrichment for developers
     │   ├── verify/route.ts          # SSE — fix verification (6 steps)
     │   ├── security/scan/route.ts   # SSE — OWASP security scan (3 steps)
     │   └── monitor/health/route.ts  # SSE — API benchmark (4 steps)
@@ -168,15 +191,16 @@ backend/
 
 ## AI Integration
 
-QA Shield uses Claude (Anthropic) at three points:
+QA Shield uses Claude (Anthropic) at four points:
 
 | Step | Prompt | Purpose |
 |---|---|---|
+| Enrich — Step 2 | `buildEnrichmentPrompt()` | Full ticket analysis → reproduction steps, affected files, fix hints, test cases |
 | Verify — Step 2 | `buildVerificationOnlyPrompt()` | Parses ticket title+description → targeted API endpoints + DOM selectors to check |
 | Security — Step 2 | `buildSecurityPrompt()` | Summarises raw security findings into structured comment for Linear |
 | Benchmark — Step 2 | `buildPerformancePrompt()` | Interprets latency data + flags regressions with context |
 
-The AI **never makes pass/fail decisions** — all verdicts are based on deterministic API + DOM check results. AI is used only for plan building and comment formatting.
+The AI **never makes pass/fail decisions on Verify** — all verdicts are based on deterministic API + DOM check results. On Enrich, AI is the primary engine — its output is the value. On Security and Benchmark, AI formats and contextualises deterministic scan results.
 
 ---
 
