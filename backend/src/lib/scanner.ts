@@ -249,6 +249,156 @@ export async function benchmarkEndpoint(url: string): Promise<PerformanceResult>
   }
 }
 
+// ============ API-Level Benchmark (per-endpoint comparison) ============
+
+export interface ApiEndpointBenchmark {
+  name: string;
+  ourEndpoint: string;
+  ourAvg: number;
+  ourP95: number;
+  ourSamples: number[];
+  competitorResults: {
+    name: string;
+    endpoint: string;
+    avg: number;
+    p95: number;
+    samples: number[];
+  }[];
+  verdict: 'faster' | 'slower' | 'similar' | 'no_competitor_data';
+  deltaMs: number;
+  deltaPct: string;
+}
+
+interface EndpointMapping {
+  name: string;
+  ourPath: string;
+  competitors: { name: string; endpoint: string }[];
+}
+
+const API_ENDPOINT_MAPPINGS: EndpointMapping[] = [
+  {
+    name: 'Token List',
+    ourPath: '/api/token/list?limit=20',
+    competitors: [
+      { name: 'pump.fun', endpoint: 'https://frontend-api.pump.fun/coins?limit=20&sort=last_trade_unix_timestamp&includeNsfw=false' },
+    ],
+  },
+  {
+    name: 'Token Search',
+    ourPath: '/api/token/search?q=test',
+    competitors: [
+      { name: 'pump.fun', endpoint: 'https://frontend-api.pump.fun/coins?searchTerm=test&limit=10' },
+    ],
+  },
+  {
+    name: 'Leaderboard Stats',
+    ourPath: '/api/leaderboard/stats',
+    competitors: [],
+  },
+  {
+    name: 'Token Detail',
+    ourPath: '/api/token/Ffyi2x1EoPPsvBkU5siaodMunHniXSfQks9SDvGz83jD',
+    competitors: [
+      { name: 'pump.fun', endpoint: 'https://frontend-api.pump.fun/coins/Ffyi2x1EoPPsvBkU5siaodMunHniXSfQks9SDvGz83jD' },
+    ],
+  },
+];
+
+async function sampleEndpoint(url: string): Promise<number> {
+  const start = performance.now();
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    await res.text(); // consume body
+    return Math.round(performance.now() - start);
+  } catch {
+    return -1;
+  }
+}
+
+function calcAvg(samples: number[]): number {
+  const valid = samples.filter(s => s >= 0);
+  if (valid.length === 0) return -1;
+  return Math.round(valid.reduce((a, b) => a + b, 0) / valid.length);
+}
+
+function calcP95(samples: number[]): number {
+  const valid = samples.filter(s => s >= 0).sort((a, b) => a - b);
+  if (valid.length === 0) return -1;
+  const idx = Math.ceil(valid.length * 0.95) - 1;
+  return valid[Math.min(idx, valid.length - 1)];
+}
+
+export async function apiLevelBenchmark(samples = 3): Promise<ApiEndpointBenchmark[]> {
+  const apiBase = process.env.STAGING_API_URL || 'https://dev.bep.creator.fun';
+  const results: ApiEndpointBenchmark[] = [];
+
+  for (const mapping of API_ENDPOINT_MAPPINGS) {
+    const ourUrl = `${apiBase}${mapping.ourPath}`;
+
+    // Sample our endpoint
+    const ourSamples: number[] = [];
+    for (let i = 0; i < samples; i++) {
+      ourSamples.push(await sampleEndpoint(ourUrl));
+      if (i < samples - 1) await new Promise(r => setTimeout(r, 300));
+    }
+
+    // Sample competitor endpoints
+    const competitorResults: ApiEndpointBenchmark['competitorResults'] = [];
+    for (const comp of mapping.competitors) {
+      const compSamples: number[] = [];
+      for (let i = 0; i < samples; i++) {
+        compSamples.push(await sampleEndpoint(comp.endpoint));
+        if (i < samples - 1) await new Promise(r => setTimeout(r, 300));
+      }
+      competitorResults.push({
+        name: comp.name,
+        endpoint: comp.endpoint,
+        avg: calcAvg(compSamples),
+        p95: calcP95(compSamples),
+        samples: compSamples,
+      });
+    }
+
+    const ourAvg = calcAvg(ourSamples);
+    const ourP95 = calcP95(ourSamples);
+
+    // Compare vs fastest competitor
+    const fastestComp = competitorResults
+      .filter(c => c.avg >= 0)
+      .sort((a, b) => a.avg - b.avg)[0];
+
+    let verdict: ApiEndpointBenchmark['verdict'] = 'no_competitor_data';
+    let deltaMs = 0;
+    let deltaPct = 'N/A';
+
+    if (fastestComp && ourAvg >= 0) {
+      deltaMs = ourAvg - fastestComp.avg;
+      const pct = fastestComp.avg > 0 ? ((deltaMs / fastestComp.avg) * 100) : 0;
+      deltaPct = `${deltaMs >= 0 ? '+' : ''}${pct.toFixed(1)}%`;
+
+      if (deltaMs > 200) verdict = 'slower';
+      else if (deltaMs < -200) verdict = 'faster';
+      else verdict = 'similar';
+    }
+
+    results.push({
+      name: mapping.name,
+      ourEndpoint: mapping.ourPath,
+      ourAvg,
+      ourP95,
+      ourSamples,
+      competitorResults,
+      verdict,
+      deltaMs,
+      deltaPct,
+    });
+  }
+
+  return results;
+}
+
+// ============ Legacy Comparative Benchmark (frontend-level) ============
+
 export async function comparativeBehnchmark(
   ourUrl: string,
   competitors: { name: string; url: string }[]

@@ -213,7 +213,7 @@ export function buildVerificationPrompt(
   issue: LinearIssue,
   enrichment: TicketEnrichment | null,
   securityResults: any[],
-  benchmark: { ours: any; axiom: any; pump: any }
+  benchmark: ApiEndpointBenchmark[]
 ): string {
   const testCases = enrichment?.testCases?.map(tc =>
     `${tc.id}: ${tc.title} [${tc.priority}]\nSteps: ${tc.steps.join(' → ')}\nExpected: ${tc.expected}`
@@ -250,9 +250,7 @@ SECURITY SCAN DATA (for separate report — do NOT use this to fail the ticket):
 ${secFailures || 'All endpoints passed'}
 
 PERFORMANCE DATA (for separate report — do NOT use this to fail the ticket):
-- creator.fun: ${benchmark.ours?.responseTime ?? 'N/A'}ms (TTFB: ${benchmark.ours?.ttfb ?? 'N/A'}ms)
-- axiom.trade: ${benchmark.axiom?.responseTime ?? 'N/A'}ms (TTFB: ${benchmark.axiom?.ttfb ?? 'N/A'}ms)
-- pump.fun: ${benchmark.pump?.responseTime ?? 'N/A'}ms (TTFB: ${benchmark.pump?.ttfb ?? 'N/A'}ms)
+${benchmark.map(b => `- ${b.name}: Our avg ${b.ourAvg}ms | ${b.competitorResults.map(c => `${c.name}: ${c.avg}ms`).join(', ') || 'No competitor data'} | ${b.verdict}`).join('\n')}
 
 Produce a JSON object with this EXACT structure:
 {
@@ -532,6 +530,14 @@ export function formatFixVerificationComment(
 
 // ============ Format: Security Assessment Comment ============
 
+const SEVERITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+const SEVERITY_BADGE: Record<string, string> = {
+  critical: '🔴 CRITICAL',
+  high: '🟠 HIGH',
+  medium: '🟡 MEDIUM',
+  low: '🟢 LOW',
+};
+
 export function formatSecurityComment(
   secSummary: { passed: number; warnings: number; failed: number },
   securityResults: any[]
@@ -539,18 +545,26 @@ export function formatSecurityComment(
   let c = `## 🔒 Security Assessment\n\n`;
   c += `✅ ${secSummary.passed} passed · ⚠️ ${secSummary.warnings} warnings · ❌ ${secSummary.failed} failed\n\n`;
 
-  const issues = securityResults.filter(r => r.overallStatus !== 'pass');
-  if (issues.length > 0) {
-    for (const r of issues) {
-      const icon = r.overallStatus === 'fail' ? '❌' : '⚠️';
-      const ep = r.endpoint.split('/api')[1] || r.endpoint;
-      c += `${icon} **\`/api${ep}\`**\n`;
-      for (const ch of r.checks) {
-        if (ch.status !== 'pass') {
-          c += `- [${ch.severity.toUpperCase()}] ${ch.details}\n`;
-        }
+  // Collect all non-pass findings, tag with endpoint, sort by severity
+  const allFindings: { severity: string; type: string; details: string; endpoint: string; status: string }[] = [];
+
+  for (const r of securityResults) {
+    for (const ch of r.checks) {
+      if (ch.status !== 'pass') {
+        const ep = r.endpoint.replace(/^https?:\/\/[^/]+/, '');
+        allFindings.push({ severity: ch.severity || 'low', type: ch.type, details: ch.details, endpoint: ep, status: ch.status });
       }
-      c += '\n';
+    }
+  }
+
+  allFindings.sort((a, b) => (SEVERITY_ORDER[a.severity] ?? 4) - (SEVERITY_ORDER[b.severity] ?? 4));
+
+  if (allFindings.length > 0) {
+    for (const f of allFindings) {
+      const badge = SEVERITY_BADGE[f.severity] || `🟢 ${f.severity.toUpperCase()}`;
+      const icon = f.status === 'fail' ? '❌' : '⚠️';
+      c += `${icon} **${badge}** — \`${f.endpoint}\`\n`;
+      c += `  - **${f.type}:** ${f.details}\n\n`;
     }
   } else {
     c += `All scanned endpoints passed security checks.\n\n`;
@@ -563,26 +577,45 @@ export function formatSecurityComment(
 
 // ============ Format: Performance Assessment Comment ============
 
-export function formatPerformanceComment(
-  benchmark: { ours: any; axiom: any; pump: any }
-): string {
-  let c = `## ⚡ Performance Assessment\n\n`;
-  c += `| Platform | Response Time | TTFB |\n`;
-  c += `|----------|--------------|------|\n`;
-  c += `| **creator.fun** | ${benchmark.ours?.responseTime ?? 'N/A'}ms | ${benchmark.ours?.ttfb ?? 'N/A'}ms |\n`;
-  c += `| axiom.trade | ${benchmark.axiom?.responseTime ?? 'N/A'}ms | ${benchmark.axiom?.ttfb ?? 'N/A'}ms |\n`;
-  c += `| pump.fun | ${benchmark.pump?.responseTime ?? 'N/A'}ms | ${benchmark.pump?.ttfb ?? 'N/A'}ms |\n\n`;
+import type { ApiEndpointBenchmark } from './scanner';
 
-  // Verdict
-  if (benchmark.ours?.responseTime > 0 && benchmark.axiom?.responseTime > 0) {
-    const diff = benchmark.ours.responseTime - benchmark.axiom.responseTime;
-    if (diff > 500) {
-      c += `⚠️ Our frontend is **${Math.round(diff)}ms slower** than axiom.trade. Consider performance optimization.\n\n`;
-    } else if (diff < -200) {
-      c += `✅ Our frontend is **${Math.round(Math.abs(diff))}ms faster** than axiom.trade.\n\n`;
-    } else {
-      c += `✅ Performance is comparable to competitors.\n\n`;
-    }
+export function formatPerformanceComment(
+  benchmarks: ApiEndpointBenchmark[]
+): string {
+  let c = `## ⚡ API Performance Benchmark\n\n`;
+  c += `| Endpoint | Our Avg | Our P95 | Competitor | Their Avg | Delta | Verdict |\n`;
+  c += `|----------|---------|---------|------------|-----------|-------|---------|\n`;
+
+  for (const b of benchmarks) {
+    const ourAvgStr = b.ourAvg >= 0 ? `${b.ourAvg}ms` : 'N/A';
+    const ourP95Str = b.ourP95 >= 0 ? `${b.ourP95}ms` : 'N/A';
+
+    const fastest = b.competitorResults
+      .filter(c => c.avg >= 0)
+      .sort((a, b) => a.avg - b.avg)[0];
+
+    const compName = fastest ? fastest.name : '—';
+    const compAvgStr = fastest ? `${fastest.avg}ms` : '—';
+    const deltaStr = b.verdict === 'no_competitor_data' ? '—' : `${b.deltaMs >= 0 ? '+' : ''}${b.deltaMs}ms`;
+
+    let verdictStr = '✅';
+    if (b.verdict === 'slower') verdictStr = '⚠️ Slower';
+    else if (b.verdict === 'faster') verdictStr = '🚀 Faster';
+    else if (b.verdict === 'similar') verdictStr = '✅ Similar';
+    else verdictStr = '✅ No baseline';
+
+    c += `| ${b.name} | ${ourAvgStr} | ${ourP95Str} | ${compName} | ${compAvgStr} | ${deltaStr} | ${verdictStr} |\n`;
+  }
+
+  c += `\n_(3 samples per endpoint)_\n\n`;
+
+  const slowerCount = benchmarks.filter(b => b.verdict === 'slower').length;
+  const totalWithComp = benchmarks.filter(b => b.verdict !== 'no_competitor_data').length;
+
+  if (slowerCount > 0) {
+    c += `⚠️ **${slowerCount} of ${totalWithComp}** endpoints are slower than competitors.\n\n`;
+  } else if (totalWithComp > 0) {
+    c += `✅ All endpoints performing competitively.\n\n`;
   }
 
   c += `> ℹ️ Performance data is informational and does not affect ticket verification.\n\n`;

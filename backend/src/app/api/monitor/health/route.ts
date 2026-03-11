@@ -4,7 +4,8 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { benchmarkEndpoint, comparativeBehnchmark } from '@/lib/scanner';
+import { benchmarkEndpoint, comparativeBehnchmark, apiLevelBenchmark } from '@/lib/scanner';
+import type { ApiEndpointBenchmark } from '@/lib/scanner';
 import {
   getIssueByIdentifier,
   addComment,
@@ -39,91 +40,35 @@ export async function POST(req: NextRequest) {
       }
 
       try {
-        const stagingApi = process.env.STAGING_API_URL || 'https://dev.bep.creator.fun';
-        const stagingUrl = process.env.STAGING_URL || 'https://dev.creator.fun';
+        // ── Step 1: API-Level Benchmark ──
+        send('step', { step: 0, status: 'active', label: 'Benchmarking 4 API endpoints (3 samples each)...' });
+        const apiBenchmarks = await apiLevelBenchmark(3);
 
-        // ── Step 1: Benchmark ──
-        send('step', { step: 0, status: 'active', label: 'Benchmarking creator.fun...' });
-        const ourPerf = await benchmarkEndpoint(stagingUrl);
-        send('step', { step: 0, status: 'done', label: `creator.fun: ${ourPerf.responseTime}ms` });
-
-        send('step', { step: 1, status: 'active', label: 'Benchmarking competitors...' });
-        const axiomPerf = await benchmarkEndpoint('https://axiom.trade');
-        const pumpPerf = await benchmarkEndpoint('https://pump.fun');
-        send('step', { step: 1, status: 'done', label: `axiom: ${axiomPerf.responseTime}ms · pump: ${pumpPerf.responseTime}ms` });
-
-        send('benchmark', { ours: ourPerf, axiom: axiomPerf, pump: pumpPerf });
+        const slowerCount = apiBenchmarks.filter(b => b.verdict === 'slower').length;
+        const totalWithComp = apiBenchmarks.filter(b => b.verdict !== 'no_competitor_data').length;
+        send('step', { step: 0, status: 'done', label: `Done: ${slowerCount}/${totalWithComp} endpoints slower than competitors` });
+        send('api_benchmark', { results: apiBenchmarks });
 
         // ── Step 2: Post to Linear ──
-        send('step', { step: 2, status: 'active', label: 'Posting to Linear...' });
+        send('step', { step: 1, status: 'active', label: 'Posting to Linear...' });
         if (postComment && identifier) {
           try {
             const issue = await getIssueByIdentifier(identifier);
-            const perfComment = formatPerformanceComment({ ours: ourPerf, axiom: axiomPerf, pump: pumpPerf });
+            const perfComment = formatPerformanceComment(apiBenchmarks);
             await addComment(issue.id, perfComment);
             send('linear_update', { type: 'performance', ticket: identifier, message: 'Performance comment posted' });
-            send('step', { step: 2, status: 'done', label: 'Comment posted' });
+            send('step', { step: 1, status: 'done', label: 'Comment posted' });
           } catch (e) {
             console.error('Failed to post perf comment:', e);
-            send('step', { step: 2, status: 'error', label: 'Failed to post comment' });
+            send('step', { step: 1, status: 'error', label: 'Failed to post comment' });
           }
         } else {
-          send('step', { step: 2, status: 'done', label: 'No ticket selected — skipped' });
+          send('step', { step: 1, status: 'done', label: 'No ticket selected — skipped' });
         }
-
-        // ── Step 3: Check for perf tickets ──
-        send('step', { step: 3, status: 'active', label: 'Checking for performance issues...' });
-
-        const createdTickets: any[] = [];
-        const existingTickets: any[] = [];
-
-        // Flag if we're significantly slower than competitors
-        if (ourPerf.responseTime > 0 && axiomPerf.responseTime > 0) {
-          const diff = ourPerf.responseTime - axiomPerf.responseTime;
-          if (diff > 500) {
-            const title = `[Performance][High] Severe performance degradation compared to competitors`;
-            const existing = await findSimilarIssue(title);
-            if (existing) {
-              existingTickets.push({
-                identifier: existing.identifier,
-                title: existing.title,
-                url: existing.url,
-                matchedFor: `${Math.round(diff)}ms slower than axiom.trade`,
-              });
-              send('existing_ticket', {
-                identifier: existing.identifier,
-                title: existing.title,
-                url: existing.url,
-                matchedFor: `${Math.round(diff)}ms slower than axiom.trade`,
-              });
-            } else {
-              try {
-                const created = await createIssue({
-                  title,
-                  description: `## Performance Degradation\n\n**creator.fun:** ${ourPerf.responseTime}ms\n**axiom.trade:** ${axiomPerf.responseTime}ms\n**pump.fun:** ${pumpPerf.responseTime}ms\n\nOur frontend is **${Math.round(diff)}ms slower** than the fastest competitor.\n\n---\n_Auto-created by QA Shield 🛡️_`,
-                  priority: 2,
-                  labelIds: [LABELS.BUG],
-                });
-                createdTickets.push(created);
-                send('new_ticket', {
-                  identifier: created.identifier,
-                  title: created.title,
-                  url: created.url,
-                });
-              } catch (e) {
-                console.error('Failed to create perf ticket:', e);
-              }
-            }
-          }
-        }
-
-        send('step', { step: 3, status: 'done', label: `${createdTickets.length} new, ${existingTickets.length} existing` });
 
         send('complete', {
           success: true,
-          benchmark: { ours: ourPerf, axiom: axiomPerf, pump: pumpPerf },
-          createdTickets,
-          existingTickets,
+          apiBenchmarks,
         });
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : 'Unknown error';

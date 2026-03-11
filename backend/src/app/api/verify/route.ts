@@ -19,7 +19,6 @@ import { verifyAPI, verifyDOM, verifyQuickBuy, closeBrowser, type VerifyCheck } 
 
 export const maxDuration = 120;
 
-const STAGING_API = process.env.STAGING_API_URL || 'https://dev.bep.creator.fun';
 const STAGING_URL = process.env.STAGING_URL || 'https://dev.creator.fun';
 
 export async function POST(req: NextRequest) {
@@ -56,11 +55,13 @@ export async function POST(req: NextRequest) {
         const allChecks: VerifyCheck[] = [];
 
         if (plan.apiChecks.length > 0) {
-          send('step', { step: 2, status: 'active', label: `Running ${plan.apiChecks.length} API checks...` });
-          for (const apiCheck of plan.apiChecks) {
-            const results = await verifyAPI(apiCheck.endpoint, apiCheck.checks);
+          send('step', { step: 2, status: 'active', label: `Running ${plan.apiChecks.length} API checks in parallel...` });
+          // ✅ Parallel — all API checks fire simultaneously
+          const apiResultGroups = await Promise.all(
+            plan.apiChecks.map(apiCheck => verifyAPI(apiCheck.endpoint, apiCheck.checks))
+          );
+          for (const results of apiResultGroups) {
             allChecks.push(...results);
-            // Stream each check result as it completes
             for (const r of results) {
               send('check', { type: 'api', ...r });
             }
@@ -89,6 +90,17 @@ export async function POST(req: NextRequest) {
           send('step', { step: 3, status: 'done', label: `DOM: ${domPassed}/${allChecks.length} total passed` });
         } else {
           send('step', { step: 3, status: 'done', label: 'No DOM checks needed' });
+        }
+
+        // ── Step 4b: Cross-checks (API value vs DOM displayed value) ──
+        if (plan.crossChecks && plan.crossChecks.length > 0) {
+          send('step', { step: 4, status: 'active', label: `Running ${plan.crossChecks.length} cross-checks (API vs UI)...` });
+          for (const cc of plan.crossChecks) {
+            const result = await runCrossCheck(cc);
+            allChecks.push(result);
+            send('check', { type: 'cross', ...result });
+          }
+          send('step', { step: 4, status: 'done', label: `Cross-checks: ${plan.crossChecks.filter((_, i) => allChecks[allChecks.length - plan.crossChecks.length + i]?.status === 'pass').length}/${plan.crossChecks.length} passed` });
         }
 
         // ── Step 5: Transaction checks (if needed) ──
@@ -166,247 +178,223 @@ export async function POST(req: NextRequest) {
 
 // ============ AI Verification Plan ============
 
+const STAGING_API_BASE = process.env.STAGING_API_URL || 'https://dev.bep.creator.fun';
+const BROWSER_WORKER = process.env.BROWSER_WORKER_URL || 'http://127.0.0.1:3099';
+
+// ── Cross-check: fetch API value, extract DOM value, compare ──
+async function runCrossCheck(cc: CrossCheck): Promise<VerifyCheck> {
+  try {
+    // 1. Fetch real value from API
+    const apiUrl = cc.apiEndpoint.startsWith('http') ? cc.apiEndpoint : `${STAGING_API_BASE}${cc.apiEndpoint}`;
+    const apiRes = await fetch(apiUrl, { signal: AbortSignal.timeout(10000) });
+    if (!apiRes.ok) {
+      return { name: cc.name, status: 'fail', details: `API ${cc.apiEndpoint} returned ${apiRes.status}` };
+    }
+    const apiData = await apiRes.json();
+    const apiValue = getNestedValue(apiData, cc.apiField);
+    if (apiValue === undefined || apiValue === null) {
+      return { name: cc.name, status: 'warn', details: `API field "${cc.apiField}" not found in response. API returned: ${JSON.stringify(apiData).substring(0, 150)}` };
+    }
+
+    // 2. Extract displayed value from DOM via browser worker
+    const domRes = await fetch(`${BROWSER_WORKER}/dom`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        path: cc.domPath,
+        checks: [{
+          name: `Extract: ${cc.domSelector}`,
+          selector: cc.domSelector,
+          action: cc.domAction || 'text',
+        }],
+      }),
+      signal: AbortSignal.timeout(45000),
+    });
+
+    const domData = await domRes.json();
+    const domResult = domData.results?.[0];
+
+    if (!domResult || domResult.status === 'fail') {
+      return {
+        name: cc.name,
+        status: 'fail',
+        details: `UI element not found on ${cc.domPath} — selector: "${cc.domSelector}". ${cc.description}`,
+      };
+    }
+
+    const domRaw = domResult.details || '';
+    // Extract numeric value from DOM text (handles "$1,234.56 SOL", "1.23 SOL", etc.)
+    const domNumMatch = domRaw.replace(/,/g, '').match(/-?\d+\.?\d*/);
+    const domValue = domNumMatch ? parseFloat(domNumMatch[0]) : null;
+    const apiNumeric = typeof apiValue === 'number' ? apiValue : parseFloat(String(apiValue).replace(/,/g, ''));
+    const tolerance = cc.tolerance ?? 0.01;
+
+    if (domValue === null) {
+      return {
+        name: cc.name,
+        status: 'warn',
+        details: `Could not extract numeric value from DOM. Element text: "${domRaw.substring(0, 100)}". API value: ${apiValue}`,
+      };
+    }
+
+    const diff = Math.abs(domValue - apiNumeric);
+    const pass = diff <= tolerance || (apiNumeric !== 0 && diff / Math.abs(apiNumeric) < 0.001);
+
+    return {
+      name: cc.name,
+      status: pass ? 'pass' : 'fail',
+      details: pass
+        ? `✅ API value (${apiNumeric}) matches UI display (${domValue}) — within tolerance`
+        : `❌ MISMATCH — API says: ${apiNumeric}, UI shows: ${domValue} (diff: ${diff.toFixed(4)}). ${cc.description}`,
+    };
+
+  } catch (err: any) {
+    return { name: cc.name, status: 'fail', details: `Cross-check error: ${err.message}` };
+  }
+}
+
+function getNestedValue(obj: any, path: string): any {
+  return path.split('.').reduce((curr: any, key: string) => {
+    if (curr == null) return undefined;
+    const arrMatch = key.match(/^(\w+)\[(\d+)\]$/);
+    if (arrMatch) return curr[arrMatch[1]]?.[parseInt(arrMatch[2])];
+    return curr[key];
+  }, obj);
+}
+
+interface CrossCheck {
+  name: string;
+  apiEndpoint: string;         // endpoint to fetch actual value from
+  apiField: string;            // dot-path to extract value e.g. "balance" or "data[0].amount"
+  domPath: string;             // page path to navigate to
+  domSelector: string;         // CSS selector of element showing the value
+  domAction?: string;          // "text" | "evaluate"
+  tolerance?: number;          // numeric tolerance for float comparison (default 0.01)
+  description: string;         // human-readable what we're checking
+}
+
 interface VerificationPlan {
   apiChecks: { endpoint: string; checks: any[] }[];
   domChecks: { path: string; checks: any[] }[];
+  crossChecks: CrossCheck[];   // API value vs DOM displayed value
   transactionCheck?: { tokenAddress: string; amount: number };
   reasoning: string;
 }
 
 async function buildVerificationPlan(issue: LinearIssue): Promise<VerificationPlan> {
+  const emptyPlan: VerificationPlan = { apiChecks: [], domChecks: [], crossChecks: [], reasoning: '' };
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return buildFallbackPlan(issue);
+
+  const systemPrompt = `You are QA Shield, a senior QA engineer verifying fixes on dev.creator.fun — a Solana meme coin trading platform.
+
+🚨 STRICT SCOPE RULE 🚨
+You must ONLY generate checks that directly verify what THIS SPECIFIC ticket says was broken or fixed.
+- If the ticket is about "liquidity showing 0" → ONLY check the liquidity value
+- If the ticket is about a missing UI element → ONLY check if that element exists
+- If the ticket is about wrong PnL calculation → ONLY check PnL numbers
+- NEVER run generic platform health checks unrelated to the ticket
+- If nothing in the ticket is testable via API or DOM → return ALL empty arrays with reasoning explaining why
+
+Platform routes: /dashboard, /chat, /leaderboard, /profile, /details/[tokenAddress], /create
+API base: https://dev.bep.creator.fun
+
+ACTUAL API endpoints (ONLY use these — no others exist):
+  GET /api/token/list?limit=20  → { data: [{name, ticker, mcap:{usd,sol,baseToken}, liquidity:{value,unit}, volume:{usd,buys,sells}, holders:{all}, change1hr, change24h, ath, banner, icon, address}], total, volume1h, volume24h }
+  GET /api/token/:address  → single token detail (same shape as list items)
+  GET /api/token/search?q=X  → { data: [...] }
+  GET /api/leaderboard/stats  → { tv:{current}, cp:{current}, uc:{current}, tc:{current}, crxPrice, platformFeeRate, rewardsPercentage, platformRevenue, dollarRewardPool, totalCrxDistributed }
+  GET /api/rewards  → returns a raw float number (known bug — not JSON)
+
+⚠️ These endpoints DO NOT EXIST: /api/holdings, /api/user, /api/chat/messages, /api/wallet/balance, /api/tokens/trending, /api/fees — DO NOT reference them.
+
+Check types — choose based on ticket:
+1. apiChecks → ticket says API returns wrong/missing data. Check specific response fields.
+2. domChecks → ticket says UI element is missing, wrong position, or wrong style. Check DOM.
+3. crossChecks → ticket says UI displays a WRONG VALUE. Fetch from API + extract from DOM + compare.
+4. transactionCheck → ticket involves buy/sell flow. Test with 0.001 SOL.
+
+Read the DEVELOPER COMMENTS section carefully — it tells you what was actually changed/fixed, narrowing your verification scope.
+
+Respond ONLY with this JSON (no markdown wrapping):
+{
+  "reasoning": "one sentence: what specifically you are checking based on the ticket",
+  "apiChecks": [{ "endpoint": "/api/...", "checks": [{ "field": "...", "exists": true }] }],
+  "domChecks": [{ "path": "/page", "checks": [{ "name": "...", "selector": "...", "action": "exists|text|count|css" }] }],
+  "crossChecks": [{ "name": "...", "description": "...", "apiEndpoint": "/api/...", "apiField": "path.to.field", "domPath": "/page", "domSelector": "CSS selector", "domAction": "text", "tolerance": 0.01 }],
+  "transactionCheck": null
+}`;
+
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2048,
+        temperature: 0,
+        system: systemPrompt,
+        messages: [{
+          role: 'user',
+          content: `Ticket: ${issue.identifier}\nTitle: ${issue.title}\nDescription: ${issue.description || '(none)'}\nLabels: ${issue.labels?.nodes?.map((l: any) => l.name).join(', ')}\n\nDeveloper comments:\n${issue.comments?.nodes?.map((c: any) => `[${c.user?.name || 'Dev'}]: ${c.body?.substring(0, 400)}`).join('\n') || 'None'}`,
+        }],
+      }),
+      signal: AbortSignal.timeout(25000),
+    });
+
+    const aiResp = await res.json();
+    if (aiResp.error) throw new Error(aiResp.error.message);
+
+    const raw = aiResp.content?.[0]?.text || '{}';
+    const jsonStr = raw.replace(/^```(?:json)?\s*/m, '').replace(/```\s*$/m, '').trim();
+    const parsed = JSON.parse(jsonStr);
+
+    return {
+      apiChecks: parsed.apiChecks || [],
+      domChecks: parsed.domChecks || [],
+      crossChecks: parsed.crossChecks || [],
+      transactionCheck: parsed.transactionCheck || undefined,
+      reasoning: parsed.reasoning || 'AI-generated verification plan',
+    };
+  } catch (err: any) {
+    console.error('[buildVerificationPlan] AI failed, falling back to regex:', err.message);
+    return buildFallbackPlan(issue);
+  }
+}
+
+// ── Regex fallback (only used when AI is unavailable) ──
+function buildFallbackPlan(issue: LinearIssue): VerificationPlan {
   const title = issue.title.toLowerCase();
   const desc = (issue.description || '').toLowerCase();
   const combined = `${title} ${desc}`;
 
-  const plan: VerificationPlan = {
-    apiChecks: [],
-    domChecks: [],
-    reasoning: '',
-  };
+  const plan: VerificationPlan = { apiChecks: [], domChecks: [], crossChecks: [], reasoning: '' };
 
-  // ── Extract endpoints from ticket ──
-  const apiMatches = combined.match(/\/api\/[\w\/\-]+/g) || [];
-  const pageMatches = combined.match(/\/(dashboard|details|profile|chat|convos|leaderboard|create)[\w\/\-]*/g) || [];
-
-  // ── Detect ticket type and build checks ──
-
-  // Leaderboard tickets
   if (combined.includes('leaderboard')) {
-    plan.apiChecks.push({
-      endpoint: '/api/leaderboard',
-      checks: [
-        { field: 'leaderboard', exists: true },
-        { field: 'total', exists: true },
-      ],
-    });
-    if (combined.includes('trading volume') || combined.includes('tradingvolume')) {
-      plan.apiChecks[plan.apiChecks.length - 1].checks.push(
-        { field: 'leaderboard[0].tradingVolume', exists: true, type: 'number' }
-      );
-    }
-    if (combined.includes('wallet balance') || combined.includes('initialdeposit')) {
-      plan.apiChecks[plan.apiChecks.length - 1].checks.push(
-        { field: 'leaderboard[0].initialDeposit', exists: true }
-      );
-    }
-    plan.domChecks.push({
-      path: '/dashboard',
-      checks: [
-        { name: 'Leaderboard button exists', selector: 'a[href*="leaderboard"], button:has-text("Leaderboard")', action: 'exists' },
-      ],
-    });
-    plan.reasoning = 'Leaderboard ticket — checking API data fields + UI presence';
-  }
-
-  // Token/coin related
-  if (combined.includes('token') || combined.includes('coin')) {
-    plan.apiChecks.push({
-      endpoint: '/api/token',
-      checks: [{ field: 'data', exists: true }],
-    });
-  }
-
-  // Search dropdown
-  if (combined.includes('search') && combined.includes('dropdown')) {
-    plan.domChecks.push({
-      path: '/details/Baea4r7r1XW4FUt2k8nToGM3pQtmmidzZP8BcKnQbRHG',
-      checks: [
-        { name: 'Search button exists in header', selector: 'button:has-text("Search"), input[placeholder*="Search"]', action: 'exists' },
-        { name: 'Search dropdown opens on click', selector: 'button:has-text("Search"), input[placeholder*="Search"]', action: 'click_and_check', afterClickSelector: '[class*="dropdown"], [class*="results"], [class*="token"]' },
-      ],
-    });
-    plan.reasoning = 'Search dropdown ticket — checking DOM presence + click interaction';
-  }
-
-  // Navigation / buttons
-  if (combined.includes('navigation') || combined.includes('button') && (combined.includes('api/sdk') || combined.includes('discover'))) {
-    plan.domChecks.push({
-      path: '/dashboard',
-      checks: [
-        { name: 'API/SDK button in nav', selector: 'a:has-text("API/SDK"), button:has-text("API/SDK")', action: 'exists' },
-        { name: 'Discover button in nav', selector: 'a:has-text("Discover"), button:has-text("Discover")', action: 'exists' },
-      ],
-    });
-    plan.reasoning = 'Navigation button ticket — checking DOM presence';
-  }
-
-  // Padding/spacing/border-radius (CSS tickets)
-  if (combined.includes('padding') || combined.includes('spacing') || combined.includes('border') || combined.includes('radius')) {
-    // Extract target values from description
-    const pxMatches = desc.match(/(\d+)px/g) || [];
-    const targetPage = pageMatches[0] || '/dashboard';
-
-    plan.domChecks.push({
-      path: targetPage.startsWith('/details') ? `/details/Baea4r7r1XW4FUt2k8nToGM3pQtmmidzZP8BcKnQbRHG` : targetPage,
-      checks: [
-        { name: 'Page loads correctly', selector: 'main, [class*="content"]', action: 'exists' },
-        {
-          name: 'CSS property inspection',
-          selector: 'body',
-          action: 'evaluate',
-          evaluate: `(() => {
-            const results = {};
-            const allEls = document.querySelectorAll('main *');
-            const radiusMap = {};
-            const paddingIssues = [];
-            for (const el of allEls) {
-              const cs = getComputedStyle(el);
-              const br = cs.borderRadius;
-              if (br && br !== '0px') radiusMap[br] = (radiusMap[br] || 0) + 1;
-            }
-            return { borderRadii: radiusMap, totalElements: allEls.length };
-          })()`,
-        },
-      ],
-    });
-    plan.reasoning = `CSS/spacing ticket — inspecting computed styles on ${targetPage}`;
-  }
-
-  // Theme tickets
-  if (combined.includes('theme') || combined.includes('background') && combined.includes('#')) {
-    plan.domChecks.push({
-      path: '/dashboard',
-      checks: [
-        { name: 'Page body background', selector: 'body', action: 'css', cssProperty: 'backgroundColor' },
-        { name: 'Theme toggle exists', selector: 'button[class*="theme"], [class*="Theme"]', action: 'exists' },
-      ],
-    });
-    plan.reasoning = 'Theme ticket — checking background colors and theme toggle';
-  }
-
-  // Expandable card
-  if (combined.includes('expand') || combined.includes('hover') && combined.includes('quick buy')) {
-    plan.domChecks.push({
-      path: '/dashboard',
-      checks: [
-        { name: 'Watchlist cards exist', selector: '[class*="cursor-pointer"]', action: 'count', expected: 2 },
-        { name: 'Expandable attributes', selector: '[data-expanded], [aria-expanded], [class*="expand"]', action: 'count' },
-      ],
-    });
-    plan.reasoning = 'Expandable card ticket — checking expand behavior';
-  }
-
-  // Chat/convos
-  if (combined.includes('chat') || combined.includes('convo') || combined.includes('message')) {
-    plan.domChecks.push({
-      path: '/chat',
-      checks: [
-        { name: 'Chat page loads', selector: 'input[placeholder*="Search"], [class*="message"]', action: 'exists' },
-        { name: 'Filter tabs visible', selector: 'button:has-text("All")', action: 'exists' },
-      ],
-    });
-    plan.reasoning = 'Chat ticket — checking chat page elements';
-  }
-
-  // Profile
-  if (combined.includes('profile') && (combined.includes('spacing') || combined.includes('equal'))) {
-    plan.domChecks.push({
-      path: '/profile',
-      checks: [
-        { name: 'Profile page loads', selector: 'main', action: 'exists' },
-        {
-          name: 'Profile section spacing',
-          selector: 'body',
-          action: 'evaluate',
-          evaluate: `(() => {
-            const grid = document.querySelector('.col-span-12.grid');
-            if (!grid) return { error: 'No grid found' };
-            const cs = getComputedStyle(grid);
-            const children = Array.from(grid.children);
-            const gaps = [];
-            for (let i = 1; i < children.length; i++) {
-              gaps.push(children[i].getBoundingClientRect().top - children[i-1].getBoundingClientRect().bottom);
-            }
-            return { gridGap: cs.gap, sectionCount: children.length, actualGaps: gaps };
-          })()`,
-        },
-      ],
-    });
-    plan.reasoning = 'Profile spacing ticket — measuring actual section gaps';
-  }
-
-  // Quick buy / transaction tickets
-  if (combined.includes('quick buy') || combined.includes('trade') || combined.includes('buy') && combined.includes('transaction')) {
-    plan.transactionCheck = {
-      tokenAddress: 'Baea4r7r1XW4FUt2k8nToGM3pQtmmidzZP8BcKnQbRHG',
-      amount: 0.001,
-    };
-    plan.reasoning += ' + transaction test with 0.001 SOL';
-  }
-
-  // TradingView chart
-  if (combined.includes('tradingview') || combined.includes('chart') && combined.includes('volume')) {
-    plan.domChecks.push({
-      path: '/details/Baea4r7r1XW4FUt2k8nToGM3pQtmmidzZP8BcKnQbRHG',
-      checks: [
-        { name: 'TradingView iframe exists', selector: 'iframe[src*="tradingview"], iframe[class*="chart"]', action: 'exists' },
-        { name: 'Chart container has content', selector: '[class*="chart"], [class*="Chart"]', action: 'exists' },
-      ],
-    });
-    plan.reasoning = 'Chart ticket — checking TradingView iframe presence (cross-origin limits apply)';
-  }
-
-  // Sidebar / token details
-  if (combined.includes('sidebar') || combined.includes('tokensidebardetails')) {
-    plan.domChecks.push({
-      path: '/details/Baea4r7r1XW4FUt2k8nToGM3pQtmmidzZP8BcKnQbRHG',
-      checks: [
-        { name: 'Token detail page loads', selector: 'main', action: 'exists' },
-        { name: 'MKT CAP label exists', selector: '*:has-text("MKT CAP")', action: 'exists' },
-      ],
-    });
-    plan.reasoning = 'Token sidebar ticket — checking detail page elements';
-  }
-
-  // Generic API endpoints from ticket text
-  for (const ep of apiMatches) {
-    if (!plan.apiChecks.find(c => c.endpoint === ep)) {
-      plan.apiChecks.push({
-        endpoint: ep,
-        checks: [{ field: 'data', exists: true }],
-      });
-    }
-  }
-
-  // Fallback: if no checks generated, at least check the main page loads
-  if (plan.apiChecks.length === 0 && plan.domChecks.length === 0) {
-    plan.domChecks.push({
-      path: '/dashboard',
-      checks: [
-        { name: 'Main page loads', selector: 'main', action: 'exists' },
-        { name: 'No error state', selector: '[class*="error"], [class*="Error"]', action: 'count', expected: 0 },
-      ],
-    });
-    plan.reasoning = 'Generic ticket — verifying page loads without errors';
-  }
-
-  if (!plan.reasoning) {
-    plan.reasoning = `Auto-detected: ${plan.apiChecks.length} API checks, ${plan.domChecks.length} DOM check groups`;
+    plan.apiChecks.push({ endpoint: '/api/leaderboard/stats', checks: [{ field: 'tv', exists: true }, { field: 'crxPrice', exists: true }] });
+    plan.domChecks.push({ path: '/leaderboard', checks: [{ name: 'Leaderboard page loads', selector: 'main', action: 'exists' }] });
+    plan.reasoning = 'Leaderboard ticket — checking leaderboard/stats API + page DOM';
+  } else if (combined.includes('liquidity') || combined.includes('mcap') || combined.includes('market cap') || combined.includes('volume') || combined.includes('holders')) {
+    plan.apiChecks.push({ endpoint: '/api/token/list?limit=5', checks: [{ field: 'data', type: 'array' }, { field: 'data', minLength: 1 }] });
+    plan.reasoning = 'Token data ticket — checking token list API for relevant fields';
+  } else if (combined.includes('balance') || combined.includes('chat') || combined.includes('pill')) {
+    plan.domChecks.push({ path: '/chat', checks: [{ name: 'Chat page loads', selector: 'main', action: 'exists' }] });
+    plan.reasoning = 'Chat/balance ticket — checking chat page DOM';
+  } else if (combined.includes('settings') || combined.includes('404')) {
+    plan.domChecks.push({ path: '/settings', checks: [{ name: 'Settings page loads (no 404)', selector: 'main', action: 'exists' }] });
+    plan.reasoning = 'Settings/404 ticket — checking page renders without error';
+  } else {
+    // No specific scope detected — don't run irrelevant generic checks
+    plan.reasoning = 'Ticket scope unclear — no automatable checks could be derived from the title/description. Manual verification required.';
   }
 
   return plan;
 }
-
 // ============ Format Comment ============
 
 function formatRealVerificationComment(

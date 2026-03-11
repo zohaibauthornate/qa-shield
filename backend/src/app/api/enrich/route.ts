@@ -1,93 +1,126 @@
 /**
- * POST /api/enrich
- * Enriches a Linear ticket with precise QA analysis
- * Posts structured enrichment as a comment on the Linear ticket
+ * POST /api/enrich — SSE streaming ticket enrichment
+ * Enriches a Linear ticket with AI analysis and posts it as a comment
  */
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getIssueByIdentifier, addComment } from '@/lib/linear';
 import { buildEnrichmentPrompt, formatEnrichmentAsComment, type TicketEnrichment } from '@/lib/ai';
 
+export const maxDuration = 120;
+
 export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
-    const { identifier, postComment = true } = body;
+  const body = await req.json();
+  const { identifier, postComment = true } = body;
 
-    if (!identifier) {
-      return NextResponse.json({ error: 'identifier required (e.g. CRX-829)' }, { status: 400 });
-    }
-
-    // 1. Fetch ticket from Linear
-    const issue = await getIssueByIdentifier(identifier);
-    if (!issue) {
-      return NextResponse.json({ error: `Issue ${identifier} not found` }, { status: 404 });
-    }
-
-    // 2. Build AI prompt and get enrichment
-    const prompt = buildEnrichmentPrompt(issue);
-    let enrichment: TicketEnrichment;
-
-    if (process.env.ANTHROPIC_API_KEY) {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': process.env.ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 4096,
-          temperature: 0.2,
-          system: 'You are QA Shield, a senior QA automation engineer. Respond ONLY with valid JSON matching the exact structure requested. No markdown wrapping, no explanation — just the JSON object.',
-          messages: [{ role: 'user', content: prompt }],
-        }),
-      });
-
-      const aiResponse = await res.json();
-      if (aiResponse.error) throw new Error(aiResponse.error.message);
-
-      const content = aiResponse.content?.[0]?.text || '{}';
-      const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, content];
-      enrichment = JSON.parse(jsonMatch[1].trim());
-    } else if (process.env.OPENAI_API_KEY) {
-      const { default: OpenAI } = await import('openai');
-      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        messages: [
-          { role: 'system', content: 'You are QA Shield, a senior QA automation engineer. Respond ONLY with valid JSON.' },
-          { role: 'user', content: prompt },
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 0.2,
-      });
-
-      enrichment = JSON.parse(completion.choices[0].message.content || '{}');
-    } else {
-      enrichment = generateFallbackEnrichment(issue);
-    }
-
-    // 3. Post enrichment as Linear comment
-    let commentId: string | null = null;
-    if (postComment) {
-      const commentBody = formatEnrichmentAsComment(enrichment);
-      commentId = await addComment(issue.id, commentBody);
-    }
-
-    return NextResponse.json({
-      success: true,
-      identifier: issue.identifier,
-      enrichment,
-      commentId,
-      commentPosted: postComment,
-    });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Unknown error';
-    console.error('Enrich error:', message);
-    return NextResponse.json({ error: message }, { status: 500 });
+  if (!identifier) {
+    return NextResponse.json({ error: 'identifier required (e.g. CRX-829)' }, { status: 400 });
   }
+
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      function send(event: string, data: unknown) {
+        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      }
+
+      try {
+        // ── Step 0: Fetch ticket ──
+        send('step', { step: 0, status: 'active', label: 'Fetching ticket...' });
+        const issue = await getIssueByIdentifier(identifier);
+        if (!issue) throw new Error(`Issue ${identifier} not found`);
+        send('step', { step: 0, status: 'done', label: issue.title.substring(0, 60) });
+
+        // ── Step 1: AI analysis ──
+        send('step', { step: 1, status: 'active', label: 'Analysing with AI...' });
+
+        let enrichment: TicketEnrichment;
+
+        if (process.env.ANTHROPIC_API_KEY) {
+          const prompt = buildEnrichmentPrompt(issue);
+          const res = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': process.env.ANTHROPIC_API_KEY,
+              'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify({
+              model: 'claude-sonnet-4-20250514',
+              max_tokens: 4096,
+              temperature: 0.2,
+              system: 'You are QA Shield, a senior QA automation engineer. Respond ONLY with valid JSON matching the exact structure requested. No markdown wrapping, no explanation — just the JSON object.',
+              messages: [{ role: 'user', content: prompt }],
+            }),
+          });
+
+          const aiResponse = await res.json();
+          if (aiResponse.error) throw new Error(aiResponse.error.message);
+
+          const content = aiResponse.content?.[0]?.text || '{}';
+          const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, content];
+          enrichment = JSON.parse(jsonMatch[1].trim());
+
+        } else if (process.env.OPENAI_API_KEY) {
+          const prompt = buildEnrichmentPrompt(issue);
+          const { default: OpenAI } = await import('openai');
+          const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+          const completion = await openai.chat.completions.create({
+            model: 'gpt-4o',
+            messages: [
+              { role: 'system', content: 'You are QA Shield, a senior QA automation engineer. Respond ONLY with valid JSON.' },
+              { role: 'user', content: prompt },
+            ],
+            response_format: { type: 'json_object' },
+            temperature: 0.2,
+          });
+          enrichment = JSON.parse(completion.choices[0].message.content || '{}');
+
+        } else {
+          enrichment = generateFallbackEnrichment(issue);
+        }
+
+        send('step', { step: 1, status: 'done', label: `Classified as: ${enrichment.classification?.type || 'unknown'}` });
+
+        // ── Step 2: Post comment ──
+        let commentId: string | null = null;
+        if (postComment) {
+          send('step', { step: 2, status: 'active', label: 'Posting comment to Linear...' });
+          const commentBody = formatEnrichmentAsComment(enrichment);
+          commentId = await addComment(issue.id, commentBody);
+          send('step', { step: 2, status: 'done', label: 'Comment posted ✅' });
+        } else {
+          send('step', { step: 2, status: 'done', label: 'Skipped (postComment=false)' });
+        }
+
+        // ── Step 3: Done ──
+        send('step', { step: 3, status: 'done', label: 'Enrichment complete' });
+        send('result', {
+          success: true,
+          identifier: issue.identifier,
+          enrichment,
+          commentId,
+          commentPosted: postComment && !!commentId,
+        });
+
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : 'Unknown error';
+        console.error('Enrich SSE error:', message);
+        send('error', { error: message });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    },
+  });
 }
 
 // GET: Quick lookup

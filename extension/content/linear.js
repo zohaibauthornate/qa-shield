@@ -36,7 +36,10 @@ function createSidebar() {
         </div>
         <div class="qs-steps" id="qs-steps"></div>
         <div class="qs-live-updates" id="qs-live-updates"></div>
-        <div class="qs-elapsed" id="qs-elapsed"></div>
+        <div class="qs-progress-footer">
+          <span class="qs-elapsed" id="qs-elapsed"></span>
+          <button class="qs-cancel-btn" id="qs-cancel-btn" title="Cancel and reset">⏹ Cancel</button>
+        </div>
       </div>
       <div class="qs-results" id="qs-results" style="display:none"></div>
     </div>
@@ -70,12 +73,14 @@ function createSidebar() {
   document.getElementById('qs-verify-btn').addEventListener('click', verifyFix);
   document.getElementById('qs-security-btn').addEventListener('click', runSecurityScan);
   document.getElementById('qs-benchmark-btn').addEventListener('click', runBenchmark);
+  document.getElementById('qs-cancel-btn').addEventListener('click', cancelActiveStream);
 }
 
 // ============ Progress System ============
 
 let progressTimer = null;
 let progressStart = null;
+let activeAbortController = null; // tracks current SSE stream so cancel can kill it
 
 function showProgress(steps) {
   const welcome = document.getElementById('qs-welcome');
@@ -156,12 +161,39 @@ function setButtonsDisabled(disabled) {
     btn.style.opacity = disabled ? '0.5' : '1';
     btn.style.cursor = disabled ? 'not-allowed' : 'pointer';
   });
+  // Cancel button is always enabled during active stream, hidden otherwise
+  const cancelBtn = document.getElementById('qs-cancel-btn');
+  if (cancelBtn) cancelBtn.style.display = disabled ? 'inline-flex' : 'none';
+}
+
+function cancelActiveStream() {
+  if (activeAbortController) {
+    activeAbortController.abort();
+    activeAbortController = null;
+  }
+  clearInterval(progressTimer);
+  setButtonsDisabled(false);
+
+  // Reset panel back to welcome state
+  const progress = document.getElementById('qs-progress');
+  const results = document.getElementById('qs-results');
+  const welcome = document.getElementById('qs-welcome');
+  if (progress) progress.style.display = 'none';
+  if (results) { results.style.display = 'none'; results.innerHTML = ''; }
+  if (welcome) {
+    welcome.style.display = 'block';
+    welcome.innerHTML = '<p class="qs-muted">Cancelled. Select an action to start again.</p>';
+  }
 }
 
 // ============ Generic SSE Stream Consumer ============
 
-async function consumeSSEStream(url, method, body, steps, onComplete) {
+async function consumeSSEStream(url, method, body, steps, onComplete, onEvent) {
   showProgress(steps);
+
+  // Create a new abort controller for this stream
+  activeAbortController = new AbortController();
+  const signal = activeAbortController.signal;
 
   const finalData = { existingTickets: [], newTickets: [], result: null };
 
@@ -170,6 +202,7 @@ async function consumeSSEStream(url, method, body, steps, onComplete) {
       method,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal,
     });
 
     const reader = res.body.getReader();
@@ -191,6 +224,8 @@ async function consumeSSEStream(url, method, body, steps, onComplete) {
         } else if (line.startsWith('data: ') && currentEvent) {
           try {
             const data = JSON.parse(line.slice(6));
+
+            if (onEvent) onEvent(currentEvent, data);
 
             switch (currentEvent) {
               case 'step':
@@ -221,6 +256,9 @@ async function consumeSSEStream(url, method, body, steps, onComplete) {
                   `<a href="${data.url}" target="_blank" class="qs-ticket-link">${data.identifier}</a> — ${data.title}`
                 );
                 break;
+              case 'result':
+                finalData.result = data;
+                break;
               case 'complete':
                 finalData.result = data;
                 break;
@@ -244,8 +282,11 @@ async function consumeSSEStream(url, method, body, steps, onComplete) {
       showError('No data received from server');
     }
   } catch (err) {
+    if (err.name === 'AbortError') return; // user cancelled — already handled by cancelActiveStream
     finishProgress();
     showError(`Failed: ${err.message}`);
+  } finally {
+    activeAbortController = null;
   }
 }
 
@@ -314,50 +355,66 @@ async function runBenchmark() {
   );
 }
 
-// ============ Enrich Ticket (non-streaming) ============
+// ============ Enrich Ticket (SSE streaming + animated AI substeps) ============
 
 async function enrichTicket() {
   const identifier = getIssueIdentifier();
   if (!identifier) return showError('Could not detect ticket ID');
 
   const steps = [
-    'Fetching ticket details...',
-    'Analyzing issue context...',
-    'Generating QA report...',
+    'Fetching ticket...',
+    'Analysing with AI...',
     'Posting to Linear...',
+    'Done',
   ];
-  showProgress(steps);
 
-  try {
-    updateStep(0, 'active');
-    await sleep(300);
-    updateStep(0, 'done');
+  // Sub-messages that rotate while AI is thinking (step 1)
+  const aiSubSteps = [
+    '🔍 Reading ticket context...',
+    '🧠 Identifying root cause...',
+    '📂 Mapping affected files...',
+    '🔧 Building fix approach...',
+    '🧪 Generating test cases...',
+    '⚡ Checking edge cases...',
+    '📝 Formatting report...',
+  ];
 
-    updateStep(1, 'active');
-    const res = await fetch(`${QA_SHIELD_API}/api/enrich`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier, postComment: true }),
-    });
+  let aiSubTimer = null;
+  let aiSubIndex = 0;
 
-    updateStep(1, 'done');
-    updateStep(2, 'active');
-    await sleep(200);
-
-    const data = await res.json();
-    if (!data.success) throw new Error(data.error);
-
-    updateStep(2, 'done');
-    updateStep(3, 'active');
-    await sleep(200);
-    updateStep(3, 'done');
-    finishProgress();
-
-    showEnrichmentResults(data.enrichment, data.commentPosted);
-  } catch (err) {
-    finishProgress();
-    showError(`Enrichment failed: ${err.message}`);
+  function startAIAnimation() {
+    addLiveUpdate(`<span class="qs-muted">${aiSubSteps[0]}</span>`);
+    aiSubTimer = setInterval(() => {
+      aiSubIndex = (aiSubIndex + 1) % aiSubSteps.length;
+      const liveEl = document.getElementById('qs-live-updates');
+      if (liveEl && liveEl.lastElementChild) {
+        liveEl.lastElementChild.innerHTML = `<span class="qs-muted">${aiSubSteps[aiSubIndex]}</span>`;
+      }
+    }, 900);
   }
+
+  function stopAIAnimation() {
+    if (aiSubTimer) { clearInterval(aiSubTimer); aiSubTimer = null; }
+  }
+
+  await consumeSSEStream(
+    `${QA_SHIELD_API}/api/enrich`,
+    'POST',
+    { identifier, postComment: true },
+    steps,
+    (finalData) => {
+      stopAIAnimation();
+      if (finalData.result) {
+        showEnrichmentResults(finalData.result.enrichment, finalData.result.commentPosted);
+      }
+    },
+    (event, data) => {
+      if (event === 'step') {
+        if (data.step === 1 && data.status === 'active') startAIAnimation();
+        if (data.step === 1 && data.status === 'done') stopAIAnimation();
+      }
+    }
+  );
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
