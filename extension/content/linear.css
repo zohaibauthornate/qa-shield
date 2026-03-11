@@ -549,3 +549,49 @@
 .qs-content::-webkit-scrollbar-thumb { background: #2a2a3a; border-radius: 3px; }
 .qs-live-updates::-webkit-scrollbar { width: 4px; }
 .qs-live-updates::-webkit-scrollbar-thumb { background: #2a2a3a; border-radius: 2px; }
+
+/* ── Sprint 4: Full Scan button ── */
+.qs-btn-full {
+  background: linear-gradient(135deg, #7c3aed, #4f46e5);
+  color: #fff;
+  border: none;
+}
+.qs-btn-full:hover { background: linear-gradient(135deg, #6d28d9, #4338ca); }
+
+/* ── Sprint 4: Benchmark Table ── */
+.qs-bench-table { font-size: 11px; border-collapse: collapse; width: 100%; }
+.qs-bench-header, .qs-bench-row {
+  display: grid;
+  grid-template-columns: 1.4fr 0.7fr 0.7fr 1fr;
+  gap: 4px;
+  padding: 5px 4px;
+  border-bottom: 1px solid #1e1e2e;
+  align-items: start;
+}
+.qs-bench-header { color: #888; font-weight: 600; font-size: 10px; text-transform: uppercase; }
+.qs-bench-row.qs-v-slow { background: rgba(239,68,68,0.06); }
+.qs-bench-row.qs-v-fast { background: rgba(34,197,94,0.06); }
+.qs-ep-name { font-weight: 600; color: #c4b5fd; word-break: break-all; }
+.qs-delta { font-size: 10px; color: #f87171; margin-left: 2px; }
+
+/* ── Sprint 4: Regression rows ── */
+.qs-reg-row { font-size: 11px; padding: 4px 0; border-bottom: 1px solid #1e1e2e; }
+.qs-reg-row.qs-reg-bad { color: #f87171; }
+.qs-reg-row.qs-reg-good { color: #4ade80; }
+
+/* ── Sprint 4: Payload rows ── */
+.qs-payload-row {
+  display: grid;
+  grid-template-columns: 2fr 0.6fr 0.8fr;
+  gap: 4px;
+  font-size: 11px;
+  padding: 4px 0;
+  border-bottom: 1px solid #1e1e2e;
+}
+.qs-payload-row.qs-payload-warn { color: #fbbf24; }
+
+/* ── Sprint 4: Load test rows ── */
+.qs-load-row { font-size: 11px; padding: 4px 0; border-bottom: 1px solid #1e1e2e; }
+
+/* ── Live badge colors ── */
+.qs-live-warn { background: rgba(251,191,36,0.2); color: #fbbf24; }

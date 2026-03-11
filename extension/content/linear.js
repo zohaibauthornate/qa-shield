@@ -1,6 +1,7 @@
 /**
- * QA Shield v0.3 — Linear Content Script
+ * QA Shield v0.4 — Linear Content Script
  * SSE streaming for real-time updates, ticket ID tracking, security labels
+ * Sprint 4: new benchmark UI, regression/payload/load sections, Full Scan button
  */
 
 const QA_SHIELD_API = 'http://localhost:3000';
@@ -23,7 +24,7 @@ function createSidebar() {
     <div class="qs-header">
       <span class="qs-logo">🛡️</span>
       <span class="qs-title">QA Shield</span>
-      <span class="qs-version">v0.3</span>
+      <span class="qs-version">v0.4</span>
       <button class="qs-close" id="qs-close-btn">×</button>
     </div>
     <div class="qs-content" id="qs-content">
@@ -48,6 +49,7 @@ function createSidebar() {
       <button class="qs-btn qs-btn-secondary" id="qs-verify-btn">✅ Verify Fix</button>
       <button class="qs-btn qs-btn-warn" id="qs-security-btn">🔒 Security Scan</button>
       <button class="qs-btn qs-btn-info" id="qs-benchmark-btn">⚡ Benchmark</button>
+      <button class="qs-btn qs-btn-full" id="qs-fullscan-btn">🛡️ Full Scan</button>
     </div>
   `;
 
@@ -73,6 +75,7 @@ function createSidebar() {
   document.getElementById('qs-verify-btn').addEventListener('click', verifyFix);
   document.getElementById('qs-security-btn').addEventListener('click', runSecurityScan);
   document.getElementById('qs-benchmark-btn').addEventListener('click', runBenchmark);
+  document.getElementById('qs-fullscan-btn').addEventListener('click', runFullScan);
   document.getElementById('qs-cancel-btn').addEventListener('click', cancelActiveStream);
 }
 
@@ -256,6 +259,33 @@ async function consumeSSEStream(url, method, body, steps, onComplete, onEvent) {
                   `<a href="${data.url}" target="_blank" class="qs-ticket-link">${data.identifier}</a> — ${data.title}`
                 );
                 break;
+              case 'api_benchmark':
+                finalData.apiBenchmarks = data.results;
+                addLiveUpdate(`<span class="qs-live-badge qs-live-verification">⚡ Benchmark</span> ${data.results.filter(r=>r.verdict==='slower').length}/${data.results.filter(r=>r.verdict!=='no_competitor_data').length} slower than competitors`);
+                break;
+              case 'load_test':
+                finalData.loadResults = data.results;
+                addLiveUpdate(`<span class="qs-live-badge qs-live-verification">🔄 Load Test</span> ${data.results.filter(r=>r.verdict==='degraded').length} degraded under concurrent load`);
+                break;
+              case 'regression':
+                finalData.regressions = data.results;
+                const regressed = data.results.filter(r => r.verdict === 'regressed');
+                if (regressed.length > 0) addLiveUpdate(`<span class="qs-live-badge qs-live-warn">⚠️ Regression</span> ${regressed.map(r=>`${r.endpoint} +${r.deltaPct}%`).join(', ')}`);
+                break;
+              case 'payloads':
+                finalData.payloads = data.results;
+                break;
+              case 'websocket':
+                finalData.wsResult = data.result;
+                if (data.result.status === 'connected') addLiveUpdate(`<span class="qs-live-badge qs-live-verification">🔌 WS</span> Connected in ${data.result.connectMs}ms`);
+                break;
+              case 'report':
+                finalData.reportPath = data.path;
+                finalData.reportContent = data.content;
+                break;
+              case 'security':
+                finalData.securityData = data;
+                break;
               case 'result':
                 finalData.result = data;
                 break;
@@ -344,15 +374,65 @@ async function runBenchmark() {
     'POST',
     { identifier, postComment: !!identifier },
     [
-      'Benchmarking creator.fun...',
-      'Benchmarking competitors...',
+      'API timing vs pump.fun + axiom...',
+      'Payload size analysis...',
+      'Regression vs baseline...',
+      'Concurrent load test...',
+      'WebSocket benchmark...',
+      'Performance auto-ticket check...',
       'Posting to Linear...',
-      'Checking for performance issues...',
+      'Generating report...',
     ],
     (finalData) => {
-      showBenchmarkResults(finalData.result, finalData.existingTickets, finalData.newTickets);
+      showBenchmarkResults(finalData);
     }
   );
+}
+
+// ============ Full Scan (security + benchmark combined) ============
+
+async function runFullScan() {
+  const identifier = getIssueIdentifier();
+
+  // Run security first, then benchmark — both as separate streams
+  const secData = await runStreamCollect(
+    `${QA_SHIELD_API}/api/security/scan`,
+    'POST',
+    { identifier, postComment: !!identifier },
+    [
+      '🔒 Scanning 6 endpoints...',
+      'Posting security to Linear...',
+      'Dedup check + filing tickets...',
+    ]
+  );
+
+  const benchData = await runStreamCollect(
+    `${QA_SHIELD_API}/api/monitor/health`,
+    'POST',
+    { identifier, postComment: !!identifier },
+    [
+      '⚡ API timing benchmark...',
+      'Payload analysis...',
+      'Regression check...',
+      'Load test...',
+      'WebSocket...',
+      'Perf auto-ticket...',
+      'Post to Linear...',
+      'Report...',
+    ]
+  );
+
+  showFullScanResults(secData, benchData);
+}
+
+async function runStreamCollect(url, method, body, steps) {
+  return new Promise((resolve) => {
+    const collected = { existingTickets: [], newTickets: [], result: null, apiBenchmarks: null, payloads: null, regressions: null, loadResults: null, wsResult: null, securityData: null, reportPath: null };
+    consumeSSEStream(url, method, body, steps, (finalData) => {
+      Object.assign(collected, finalData);
+      resolve(collected);
+    });
+  });
 }
 
 // ============ Enrich Ticket (SSE streaming + animated AI substeps) ============
@@ -633,41 +713,159 @@ function showSecurityResults(data, existingTickets, newTickets) {
   results.innerHTML = html;
 }
 
-// ── Benchmark Results (with ticket tracking) ──
+// ── Benchmark Results (Sprint 4 rewrite — per-endpoint format) ──
 
-function showBenchmarkResults(data, existingTickets, newTickets) {
+function showBenchmarkResults(finalData) {
   const progress = document.getElementById('qs-progress');
   const results = document.getElementById('qs-results');
   progress.style.display = 'none';
   results.style.display = 'block';
 
-  const b = data.benchmark || {};
+  const benchmarks = finalData.apiBenchmarks || (finalData.result && finalData.result.apiBenchmarks) || [];
+  const regressions = finalData.regressions || [];
+  const payloads = finalData.payloads || [];
+  const loadResults = finalData.loadResults || [];
+  const wsResult = finalData.wsResult || null;
+
+  let html = '';
+
+  // ── API Timing Table ──
+  if (benchmarks.length > 0) {
+    html += `<div class="qs-section"><h3>⚡ API Benchmark</h3>`;
+    html += `<div class="qs-bench-table">`;
+    html += `<div class="qs-bench-header"><span>Endpoint</span><span>Ours</span><span>Comp</span><span>Verdict</span></div>`;
+    benchmarks.forEach(b => {
+      const comp = b.competitorResults && b.competitorResults.find(c => c.avg >= 0);
+      const our = b.ourAvg >= 0 ? `${b.ourAvg}ms` : 'N/A';
+      const compStr = comp ? `${comp.avg}ms` : '—';
+      const verdictClass = b.verdict === 'slower' ? 'qs-v-slow' : b.verdict === 'faster' ? 'qs-v-fast' : 'qs-v-ok';
+      const verdictIcon = b.verdict === 'slower' ? '⚠️' : b.verdict === 'faster' ? '🚀' : '✅';
+      const deltaStr = b.verdict !== 'no_competitor_data' ? `<span class="qs-delta">${b.deltaMs >= 0 ? '+' : ''}${b.deltaMs}ms</span>` : '';
+      html += `<div class="qs-bench-row ${verdictClass}">
+        <span class="qs-ep-name">${b.name}</span>
+        <span>${our}<br><small>p95: ${b.ourP95 >= 0 ? b.ourP95+'ms' : 'N/A'}</small></span>
+        <span>${compStr}${comp ? `<br><small>${comp.name}</small>` : ''}</span>
+        <span>${verdictIcon} ${b.verdict !== 'no_competitor_data' ? b.deltaPct : 'no baseline'}${deltaStr}</span>
+      </div>`;
+    });
+    html += `</div></div>`;
+  }
+
+  // ── Regression Section ──
+  const nonNew = regressions.filter(r => r.verdict !== 'new');
+  if (nonNew.length > 0) {
+    html += `<div class="qs-section"><h3>📊 Regression vs Baseline</h3>`;
+    nonNew.forEach(r => {
+      const icon = r.verdict === 'regressed' ? '⚠️' : r.verdict === 'improved' ? '🚀' : '✅';
+      const cls = r.verdict === 'regressed' ? 'qs-reg-bad' : r.verdict === 'improved' ? 'qs-reg-good' : '';
+      html += `<div class="qs-reg-row ${cls}">${icon} <strong>${r.endpoint}</strong>: ${r.previousAvg}ms → ${r.currentAvg}ms <span class="qs-delta">(${r.deltaPct >= 0 ? '+' : ''}${r.deltaPct}%)</span></div>`;
+    });
+    html += `</div>`;
+  } else if (regressions.length > 0) {
+    html += `<div class="qs-section"><h3>📊 Regression</h3><div class="qs-muted">🆕 First run — baseline saved for next comparison.</div></div>`;
+  }
+
+  // ── Payload Section ──
+  if (payloads.length > 0) {
+    html += `<div class="qs-section"><h3>📦 Payload Sizes</h3>`;
+    payloads.forEach(p => {
+      const gzip = p.isGzipped ? '✅ gzip' : '❌ no gzip';
+      const cls = !p.isGzipped && p.sizeBytes > 10000 ? 'qs-payload-warn' : '';
+      html += `<div class="qs-payload-row ${cls}"><span class="qs-ep-name">${p.endpoint.replace('/api/token/list?limit=20', '/api/token/list').replace('?address=Ffyi2x1EoPPsvBkU5siaodMunHniXSfQks9SDvGz83jD', '?address=...')}</span><span>${p.sizeKb}</span><span>${gzip}</span></div>`;
+    });
+    html += `</div>`;
+  }
+
+  // ── Load Test Section ──
+  if (loadResults.length > 0) {
+    const degraded = loadResults.filter(r => r.verdict === 'degraded').length;
+    html += `<div class="qs-section"><h3>🔄 Concurrent Load (3×)</h3>`;
+    loadResults.forEach(r => {
+      const icon = r.verdict === 'degraded' ? '⚠️' : r.verdict === 'error' ? '❌' : '✅';
+      html += `<div class="qs-load-row">${icon} <span class="qs-ep-name">${r.endpoint.replace('?address=Ffyi2x1EoPPsvBkU5siaodMunHniXSfQks9SDvGz83jD','?address=...')}</span> ${r.concurrentAvg}ms concurrent${r.errors > 0 ? ` · ${r.errors} errors` : ''}</div>`;
+    });
+    if (degraded === 0) html += `<div class="qs-muted" style="margin-top:4px">All stable under 3× load ✅</div>`;
+    html += `</div>`;
+  }
+
+  // ── WebSocket Section ──
+  if (wsResult) {
+    html += `<div class="qs-section"><h3>🔌 WebSocket</h3>`;
+    if (wsResult.status === 'connected') {
+      html += `<div>✅ Connected in ${wsResult.connectMs}ms · First msg: ${wsResult.firstMessageMs}ms</div>`;
+    } else if (wsResult.status === 'not_configured') {
+      html += `<div class="qs-muted">⚠️ Not configured — set STAGING_WS_URL in .env.local</div>`;
+    } else {
+      html += `<div class="qs-alert qs-alert-warn">❌ ${wsResult.status}: ${wsResult.error}</div>`;
+    }
+    html += `</div>`;
+  }
+
+  // ── Report Link ──
+  if (finalData.reportPath) {
+    const filename = finalData.reportPath.split('/').pop();
+    html += `<div class="qs-section"><h3>📄 Report</h3><div class="qs-muted">Saved: <code>${filename}</code></div></div>`;
+  }
+
+  html += renderTicketSection(finalData.existingTickets, finalData.newTickets, '⚡ Performance');
+  results.innerHTML = html || '<div class="qs-muted">No data received.</div>';
+}
+
+// ── Full Scan Results (security + benchmark combined) ──
+
+function showFullScanResults(secData, benchData) {
+  const progress = document.getElementById('qs-progress');
+  const results = document.getElementById('qs-results');
+  progress.style.display = 'none';
+  results.style.display = 'block';
+
+  const sec = secData.securityData || secData.result || {};
+  const s = sec.summary || {};
+  const newTickets = [...(secData.newTickets || []), ...(benchData.newTickets || [])];
+  const existingTickets = [...(secData.existingTickets || []), ...(benchData.existingTickets || [])];
+
   let html = `
     <div class="qs-section">
-      <h3>⚡ Performance Benchmark</h3>
-      <div class="qs-benchmark-card">
-        <div class="qs-benchmark-row"><strong>Platform</strong><strong>Response</strong><strong>TTFB</strong></div>
-        <div class="qs-benchmark-row">
-          <span>🟢 creator.fun</span>
-          <span>${b.ours?.responseTime || 'N/A'}ms</span>
-          <span>${b.ours?.ttfb || 'N/A'}ms</span>
-        </div>
-        <div class="qs-benchmark-row">
-          <span>axiom.trade</span>
-          <span>${b.axiom?.responseTime || 'N/A'}ms</span>
-          <span>${b.axiom?.ttfb || 'N/A'}ms</span>
-        </div>
-        <div class="qs-benchmark-row">
-          <span>pump.fun</span>
-          <span>${b.pump?.responseTime || 'N/A'}ms</span>
-          <span>${b.pump?.ttfb || 'N/A'}ms</span>
-        </div>
+      <h3>🛡️ Full Scan Complete</h3>
+      <div class="qs-summary-grid">
+        <div class="qs-summary-item"><span class="qs-big-num qs-red">${s.failed || 0}</span><span>Sec Fails</span></div>
+        <div class="qs-summary-item"><span class="qs-big-num qs-yellow">${s.warnings || 0}</span><span>Sec Warns</span></div>
+        <div class="qs-summary-item"><span class="qs-big-num">${(benchData.apiBenchmarks || []).filter(b=>b.verdict==='slower').length}</span><span>Slower</span></div>
+        <div class="qs-summary-item"><span class="qs-big-num">${newTickets.length}</span><span>Tickets</span></div>
       </div>
     </div>
   `;
 
-  html += renderTicketSection(existingTickets, newTickets, '⚡ Performance');
-  html += `<div class="qs-success">✅ Performance comment posted to Linear</div>`;
+  // Security findings (critical/high only for summary)
+  if (sec.results) {
+    const criticalFindings = sec.results.flatMap(r =>
+      r.checks.filter(c => c.status === 'fail' && (c.severity === 'critical' || c.severity === 'high'))
+        .map(c => ({ ep: r.endpoint.replace('https://dev.bep.creator.fun',''), ...c }))
+    );
+    if (criticalFindings.length > 0) {
+      html += `<div class="qs-section"><h3>🔴 Critical Security Findings (${criticalFindings.length})</h3>`;
+      criticalFindings.forEach(f => {
+        html += `<div class="qs-check-row"><span class="qs-check-type">${f.type}</span><span class="qs-check-status qs-status-fail">${f.severity}</span><span class="qs-check-detail">${f.ep} — ${f.details.substring(0, 80)}</span></div>`;
+      });
+      html += `</div>`;
+    }
+  }
+
+  // Performance summary
+  const benchmarks = benchData.apiBenchmarks || [];
+  if (benchmarks.length > 0) {
+    const slower = benchmarks.filter(b => b.verdict === 'slower');
+    if (slower.length > 0) {
+      html += `<div class="qs-section"><h3>⚠️ Slow Endpoints (${slower.length})</h3>`;
+      slower.forEach(b => {
+        const comp = b.competitorResults.find(c => c.avg >= 0);
+        html += `<div class="qs-reg-row qs-reg-bad">⚠️ <strong>${b.name}</strong>: ${b.ourAvg}ms vs ${comp?.name || '?'} ${comp?.avg || '?'}ms (${b.deltaPct})</div>`;
+      });
+      html += `</div>`;
+    }
+  }
+
+  html += renderTicketSection(existingTickets, newTickets, '🛡️ Full Scan');
   results.innerHTML = html;
 }
 
