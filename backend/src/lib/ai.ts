@@ -577,10 +577,13 @@ export function formatSecurityComment(
 
 // ============ Format: Performance Assessment Comment ============
 
-import type { ApiEndpointBenchmark } from './scanner';
+import type { ApiEndpointBenchmark, RegressionResult, PayloadResult } from './scanner';
 
+// Sprint 2: updated to include regression + payload data in comment
 export function formatPerformanceComment(
-  benchmarks: ApiEndpointBenchmark[]
+  benchmarks: ApiEndpointBenchmark[],
+  regressions?: RegressionResult[],
+  payloads?: PayloadResult[]
 ): string {
   let c = `## ⚡ API Performance Benchmark\n\n`;
   c += `| Endpoint | Our Avg | Our P95 | Competitor | Their Avg | Delta | Verdict |\n`;
@@ -616,6 +619,45 @@ export function formatPerformanceComment(
     c += `⚠️ **${slowerCount} of ${totalWithComp}** endpoints are slower than competitors.\n\n`;
   } else if (totalWithComp > 0) {
     c += `✅ All endpoints performing competitively.\n\n`;
+  }
+
+  // Sprint 2: Regression section
+  if (regressions && regressions.some(r => r.verdict !== 'new')) {
+    const regressed = regressions.filter(r => r.verdict === 'regressed');
+    const improved = regressions.filter(r => r.verdict === 'improved');
+
+    c += `### Regression vs Last Run\n\n`;
+    c += `| Endpoint | Previous | Current | Change |\n`;
+    c += `|----------|----------|---------|--------|\n`;
+    for (const r of regressions.filter(r => r.verdict !== 'new')) {
+      const icon = r.verdict === 'regressed' ? '⚠️' : r.verdict === 'improved' ? '🚀' : '✅';
+      const change = `${r.deltaMs >= 0 ? '+' : ''}${r.deltaMs}ms (${r.deltaPct >= 0 ? '+' : ''}${r.deltaPct}%)`;
+      c += `| ${r.endpoint} | ${r.previousAvg}ms | ${r.currentAvg}ms | ${icon} ${change} |\n`;
+    }
+
+    if (regressed.length > 0) {
+      c += `\n⚠️ **${regressed.length}** endpoint(s) regressed >20% vs last run.\n`;
+    }
+    if (improved.length > 0) {
+      c += `\n🚀 **${improved.length}** endpoint(s) improved >20% vs last run.\n`;
+    }
+    c += '\n';
+  }
+
+  // Sprint 2: Payload section
+  if (payloads && payloads.length > 0) {
+    c += `### Payload Sizes\n\n`;
+    c += `| Endpoint | Size | Gzipped |\n`;
+    c += `|----------|------|---------|\n`;
+    for (const p of payloads) {
+      const gzip = p.isGzipped ? '✅ Yes' : '❌ No';
+      c += `| \`${p.endpoint}\` | ${p.sizeKb} | ${gzip} |\n`;
+    }
+    const unzipped = payloads.filter(p => !p.isGzipped && p.sizeBytes > 0);
+    if (unzipped.length > 0) {
+      c += `\n⚠️ ${unzipped.length} endpoint(s) not gzip-compressed.\n`;
+    }
+    c += '\n';
   }
 
   c += `> ℹ️ Performance data is informational and does not affect ticket verification.\n\n`;

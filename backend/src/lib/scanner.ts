@@ -1,7 +1,7 @@
 /**
  * Security Scanner & Performance Benchmarker for QA Shield
- * Checks CORS, auth gaps, data exposure, rate-limits + benchmarks against competitors
- * Sprint 1: fixed ghost endpoints, fixed Token Detail path, fixed auth FP, fixed dedup, added rate-limit check
+ * Sprint 1: fixed ghost endpoints, Token Detail path, auth FP, dedup, added rate-limit check
+ * Sprint 2: added input validation, payload tracking, regression tracker, WS benchmark, report engine
  */
 
 // ============ Types ============
@@ -14,7 +14,7 @@ export interface SecurityScanResult {
 }
 
 export interface SecurityCheckResult {
-  type: 'cors' | 'auth' | 'data-exposure' | 'rate-limit' | 'headers';
+  type: 'cors' | 'auth' | 'data-exposure' | 'rate-limit' | 'headers' | 'input-validation';
   status: 'pass' | 'warn' | 'fail';
   details: string;
   severity: 'critical' | 'high' | 'medium' | 'low';
@@ -54,8 +54,11 @@ export async function scanEndpoint(endpoint: string): Promise<SecurityScanResult
   // 4. Data Exposure Check
   checks.push(await checkDataExposure(endpoint));
 
-  // 5. Rate Limit Check — Sprint 1: newly implemented
+  // 5. Rate Limit Check — Sprint 1
   checks.push(await checkRateLimit(endpoint));
+
+  // 6. Input Validation Check — Sprint 2
+  checks.push(await checkInputValidation(endpoint));
 
   const overallStatus = checks.some(c => c.status === 'fail')
     ? 'fail'
@@ -550,4 +553,403 @@ export async function comparativeBehnchmark(
     verdict,
     delta,
   };
+}
+
+// ============ Sprint 2: Input Validation Check ============
+
+async function checkInputValidation(endpoint: string): Promise<SecurityCheckResult> {
+  // Only test endpoints that accept search/query parameters
+  const url = new URL(endpoint);
+  const isSearchable = url.pathname.includes('search') || url.pathname.includes('list') || url.search;
+
+  if (!isSearchable) {
+    return {
+      type: 'input-validation',
+      status: 'pass',
+      details: 'Endpoint does not accept user-supplied query parameters — skipped',
+      severity: 'low',
+    };
+  }
+
+  const baseUrl = endpoint.split('?')[0];
+  const issues: string[] = [];
+
+  const tests: { name: string; param: string; value: string; redFlags: RegExp[] }[] = [
+    {
+      name: 'XSS reflection',
+      param: 'q',
+      value: '<script>alert(1)</script>',
+      redFlags: [/<script>/i, /alert\(1\)/i],
+    },
+    {
+      name: 'SQLi error',
+      param: 'q',
+      value: "1' OR '1'='1",
+      redFlags: [/sql\s+error/i, /syntax.*near/i, /unclosed.*quotation/i, /pg.*error/i, /mysql.*error/i],
+    },
+    {
+      name: 'Path traversal',
+      param: 'q',
+      value: '../../etc/passwd',
+      redFlags: [/root:x:/i, /\[boot\s+loader\]/i, /daemon:x:/i],
+    },
+    {
+      name: 'Oversized input (DoS)',
+      param: 'q',
+      value: 'A'.repeat(5000),
+      redFlags: [], // Just check if it crashes (5xx)
+    },
+  ];
+
+  try {
+    for (const test of tests) {
+      const testUrl = `${baseUrl}?${test.param}=${encodeURIComponent(test.value)}`;
+      const res = await fetch(testUrl, { signal: AbortSignal.timeout(5000) });
+      const body = await res.text();
+
+      // Check for reflected content
+      const reflected = test.redFlags.some(pattern => pattern.test(body));
+      if (reflected) {
+        issues.push(`${test.name}: reflected in response — possible injection vector`);
+        continue;
+      }
+
+      // Check for server error on oversized input
+      if (test.name === 'Oversized input (DoS)' && res.status >= 500) {
+        issues.push(`${test.name}: server returned ${res.status} — possible DoS vector`);
+        continue;
+      }
+
+      // Check for unexpected 5xx on any test
+      if (res.status >= 500) {
+        issues.push(`${test.name}: server error ${res.status} — possible unstable handling`);
+      }
+    }
+
+    if (issues.length > 0) {
+      return {
+        type: 'input-validation',
+        status: 'fail',
+        details: `Input validation issues: ${issues.join(' | ')}`,
+        severity: 'high',
+      };
+    }
+
+    return {
+      type: 'input-validation',
+      status: 'pass',
+      details: `All ${tests.length} input validation checks passed (XSS, SQLi, path traversal, DoS)`,
+      severity: 'low',
+    };
+  } catch (err) {
+    return {
+      type: 'input-validation',
+      status: 'warn',
+      details: `Could not run input validation: ${err}`,
+      severity: 'medium',
+    };
+  }
+}
+
+// ============ Sprint 2: Payload Size Tracking ============
+
+export interface PayloadResult {
+  endpoint: string;
+  sizeBytes: number;
+  sizeKb: string;
+  isGzipped: boolean;
+  contentType: string;
+}
+
+export async function measurePayload(url: string): Promise<PayloadResult> {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const body = await res.text();
+    const sizeBytes = new TextEncoder().encode(body).length;
+    const isGzipped = (res.headers.get('content-encoding') || '').includes('gzip');
+    const contentType = res.headers.get('content-type') || 'unknown';
+
+    return {
+      endpoint: url.replace(/^https?:\/\/[^/]+/, ''),
+      sizeBytes,
+      sizeKb: (sizeBytes / 1024).toFixed(1) + 'KB',
+      isGzipped,
+      contentType,
+    };
+  } catch {
+    return {
+      endpoint: url.replace(/^https?:\/\/[^/]+/, ''),
+      sizeBytes: -1,
+      sizeKb: 'N/A',
+      isGzipped: false,
+      contentType: 'error',
+    };
+  }
+}
+
+// ============ Sprint 2: Regression Tracker ============
+
+import * as fs from 'fs';
+import * as path from 'path';
+
+const BASELINE_PATH = path.join(process.cwd(), 'src', 'data', 'benchmark-baseline.json');
+
+export interface RegressionResult {
+  endpoint: string;
+  previousAvg: number;
+  currentAvg: number;
+  deltaMs: number;
+  deltaPct: number;
+  verdict: 'improved' | 'regressed' | 'new' | 'stable';
+}
+
+export function loadBaseline(): Record<string, number> {
+  try {
+    if (fs.existsSync(BASELINE_PATH)) {
+      return JSON.parse(fs.readFileSync(BASELINE_PATH, 'utf8'));
+    }
+  } catch { /* ignore */ }
+  return {};
+}
+
+export function saveBaseline(benchmarks: ApiEndpointBenchmark[]): void {
+  try {
+    const dir = path.dirname(BASELINE_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    const existing = loadBaseline();
+    for (const b of benchmarks) {
+      if (b.ourAvg >= 0) existing[b.name] = b.ourAvg;
+    }
+    fs.writeFileSync(BASELINE_PATH, JSON.stringify(existing, null, 2));
+  } catch (err) {
+    console.warn('Could not save benchmark baseline:', err);
+  }
+}
+
+export function compareToBaseline(benchmarks: ApiEndpointBenchmark[]): RegressionResult[] {
+  const baseline = loadBaseline();
+  return benchmarks.map(b => {
+    const prev = baseline[b.name];
+    if (prev === undefined || b.ourAvg < 0) {
+      return {
+        endpoint: b.name,
+        previousAvg: -1,
+        currentAvg: b.ourAvg,
+        deltaMs: 0,
+        deltaPct: 0,
+        verdict: 'new' as const,
+      };
+    }
+
+    const deltaMs = b.ourAvg - prev;
+    const deltaPct = prev > 0 ? Math.round((deltaMs / prev) * 100) : 0;
+    let verdict: RegressionResult['verdict'] = 'stable';
+    if (deltaMs > 0 && deltaPct > 20) verdict = 'regressed';
+    else if (deltaMs < 0 && deltaPct < -20) verdict = 'improved';
+
+    return { endpoint: b.name, previousAvg: prev, currentAvg: b.ourAvg, deltaMs, deltaPct, verdict };
+  });
+}
+
+// ============ Sprint 2: WebSocket Benchmark ============
+
+export interface WebSocketBenchmarkResult {
+  url: string;
+  connectMs: number;
+  firstMessageMs: number;
+  status: 'connected' | 'timeout' | 'error' | 'not_configured';
+  error?: string;
+}
+
+export async function benchmarkWebSocket(wsUrl?: string): Promise<WebSocketBenchmarkResult> {
+  const url = wsUrl || process.env.STAGING_WS_URL;
+
+  if (!url) {
+    return {
+      url: 'not configured',
+      connectMs: -1,
+      firstMessageMs: -1,
+      status: 'not_configured',
+      error: 'Set STAGING_WS_URL in .env.local to enable WebSocket benchmarking',
+    };
+  }
+
+  return new Promise((resolve) => {
+    const startTime = Date.now();
+    let connectTime = -1;
+
+    try {
+      // Dynamic import to avoid issues in non-Node environments
+      const WebSocket = require('ws');
+      const ws = new WebSocket(url, { handshakeTimeout: 5000 });
+
+      const timeout = setTimeout(() => {
+        ws.terminate();
+        resolve({
+          url,
+          connectMs: connectTime >= 0 ? connectTime : -1,
+          firstMessageMs: -1,
+          status: 'timeout',
+          error: 'Timeout waiting for first message (5s)',
+        });
+      }, 5000);
+
+      ws.on('open', () => {
+        connectTime = Date.now() - startTime;
+      });
+
+      ws.on('message', () => {
+        clearTimeout(timeout);
+        ws.close();
+        resolve({
+          url,
+          connectMs: connectTime,
+          firstMessageMs: Date.now() - startTime,
+          status: 'connected',
+        });
+      });
+
+      ws.on('error', (err: Error) => {
+        clearTimeout(timeout);
+        resolve({
+          url,
+          connectMs: connectTime,
+          firstMessageMs: -1,
+          status: 'error',
+          error: err.message,
+        });
+      });
+    } catch (err) {
+      resolve({
+        url,
+        connectMs: -1,
+        firstMessageMs: -1,
+        status: 'error',
+        error: String(err),
+      });
+    }
+  });
+}
+
+// ============ Sprint 2: Report Engine ============
+
+import * as os from 'os';
+
+export interface QAShieldReport {
+  runId: string;
+  timestamp: string;
+  target: string;
+  securitySummary: { passed: number; warnings: number; failed: number; total: number };
+  benchmarkSummary: { slower: number; total: number };
+  regressions: RegressionResult[];
+  wsResult: WebSocketBenchmarkResult | null;
+  payloads: PayloadResult[];
+  newTickets: string[];
+  existingTickets: string[];
+  durationMs: number;
+}
+
+export function generateMarkdownReport(report: QAShieldReport): string {
+  const d = new Date(report.timestamp);
+  const dateStr = d.toISOString().replace('T', ' ').substring(0, 16) + ' UTC';
+  const lines: string[] = [];
+
+  lines.push(`# QA Shield Run Report`);
+  lines.push(`**Run ID:** ${report.runId}`);
+  lines.push(`**Date:** ${dateStr}`);
+  lines.push(`**Target:** ${report.target}`);
+  lines.push(`**Duration:** ${(report.durationMs / 1000).toFixed(1)}s`);
+  lines.push('');
+
+  // Executive Summary
+  lines.push('## Executive Summary');
+  lines.push('');
+  lines.push('| Category | Pass | Warn | Fail | Total |');
+  lines.push('|----------|------|------|------|-------|');
+  const s = report.securitySummary;
+  lines.push(`| Security | ${s.passed} | ${s.warnings} | ${s.failed} | ${s.total} |`);
+  const b = report.benchmarkSummary;
+  lines.push(`| Performance | ${b.total - b.slower} | 0 | ${b.slower} | ${b.total} |`);
+  lines.push('');
+
+  // Performance Benchmark
+  if (report.payloads.length > 0) {
+    lines.push('## Performance & Payload');
+    lines.push('');
+    lines.push('| Endpoint | Size | Gzipped | Content-Type |');
+    lines.push('|----------|------|---------|--------------|');
+    for (const p of report.payloads) {
+      lines.push(`| ${p.endpoint} | ${p.sizeKb} | ${p.isGzipped ? '✅' : '❌'} | ${p.contentType.split(';')[0]} |`);
+    }
+    lines.push('');
+  }
+
+  // Regression Analysis
+  if (report.regressions.length > 0) {
+    lines.push('## Regression Analysis');
+    lines.push('');
+    lines.push('| Endpoint | Previous | Current | Delta | Status |');
+    lines.push('|----------|----------|---------|-------|--------|');
+    for (const r of report.regressions) {
+      const prev = r.previousAvg >= 0 ? `${r.previousAvg}ms` : 'N/A';
+      const curr = r.currentAvg >= 0 ? `${r.currentAvg}ms` : 'N/A';
+      const delta = r.verdict === 'new' ? '—' : `${r.deltaMs >= 0 ? '+' : ''}${r.deltaMs}ms (${r.deltaPct >= 0 ? '+' : ''}${r.deltaPct}%)`;
+      const icon = r.verdict === 'regressed' ? '⚠️ Regressed' : r.verdict === 'improved' ? '🚀 Improved' : r.verdict === 'new' ? '🆕 New' : '✅ Stable';
+      lines.push(`| ${r.endpoint} | ${prev} | ${curr} | ${delta} | ${icon} |`);
+    }
+    lines.push('');
+  }
+
+  // WebSocket
+  if (report.wsResult) {
+    lines.push('## WebSocket Benchmark');
+    lines.push('');
+    const ws = report.wsResult;
+    if (ws.status === 'not_configured') {
+      lines.push(`> ⚠️ WebSocket benchmark not configured. Set \`STAGING_WS_URL\` in \`.env.local\`.`);
+    } else if (ws.status === 'connected') {
+      lines.push(`- **URL:** \`${ws.url}\``);
+      lines.push(`- **Connect time:** ${ws.connectMs}ms`);
+      lines.push(`- **First message:** ${ws.firstMessageMs}ms`);
+      lines.push(`- **Status:** ✅ Connected`);
+    } else {
+      lines.push(`- **URL:** \`${ws.url}\``);
+      lines.push(`- **Status:** ❌ ${ws.status} — ${ws.error}`);
+    }
+    lines.push('');
+  }
+
+  // Linear Actions
+  if (report.newTickets.length > 0 || report.existingTickets.length > 0) {
+    lines.push('## Linear Actions');
+    lines.push('');
+    if (report.newTickets.length > 0) {
+      lines.push(`**Created (${report.newTickets.length}):** ${report.newTickets.join(', ')}`);
+    }
+    if (report.existingTickets.length > 0) {
+      lines.push(`**Skipped/Existing (${report.existingTickets.length}):** ${report.existingTickets.join(', ')}`);
+    }
+    lines.push('');
+  }
+
+  lines.push('---');
+  lines.push(`_Generated by QA Shield 🛡️_`);
+
+  return lines.join('\n');
+}
+
+export function saveReport(report: QAShieldReport, content: string): string {
+  try {
+    const reportsDir = path.join(process.cwd(), 'reports');
+    if (!fs.existsSync(reportsDir)) fs.mkdirSync(reportsDir, { recursive: true });
+
+    const filename = `qa-shield-${report.runId}.md`;
+    const filepath = path.join(reportsDir, filename);
+    fs.writeFileSync(filepath, content);
+    return filepath;
+  } catch (err) {
+    console.warn('Could not save report:', err);
+    return '';
+  }
 }
