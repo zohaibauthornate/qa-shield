@@ -1,6 +1,7 @@
 /**
  * Security Scanner & Performance Benchmarker for QA Shield
- * Checks CORS, auth gaps, data exposure + benchmarks against competitors
+ * Checks CORS, auth gaps, data exposure, rate-limits + benchmarks against competitors
+ * Sprint 1: fixed ghost endpoints, fixed Token Detail path, fixed auth FP, fixed dedup, added rate-limit check
  */
 
 // ============ Types ============
@@ -53,6 +54,9 @@ export async function scanEndpoint(endpoint: string): Promise<SecurityScanResult
   // 4. Data Exposure Check
   checks.push(await checkDataExposure(endpoint));
 
+  // 5. Rate Limit Check — Sprint 1: newly implemented
+  checks.push(await checkRateLimit(endpoint));
+
   const overallStatus = checks.some(c => c.status === 'fail')
     ? 'fail'
     : checks.some(c => c.status === 'warn')
@@ -102,6 +106,20 @@ async function checkCORS(endpoint: string): Promise<SecurityCheckResult> {
   }
 }
 
+// Sprint 1 Fix: Tightened auth keyword scan — no more false positives from "creatorWallet"
+// Now checks for explicit user-private field names only
+const PRIVATE_FIELD_PATTERNS = [
+  /"userId"\s*:/i,
+  /"email"\s*:/i,
+  /"privateKey"\s*:/i,
+  /"walletAddress"\s*:/i,
+  /"seedPhrase"\s*:/i,
+  /"mnemonic"\s*:/i,
+  /"accessToken"\s*:/i,
+  /"authToken"\s*:/i,
+  /"sessionToken"\s*:/i,
+];
+
 async function checkAuth(endpoint: string): Promise<SecurityCheckResult> {
   try {
     const res = await fetch(endpoint, { method: 'GET' });
@@ -115,17 +133,34 @@ async function checkAuth(endpoint: string): Promise<SecurityCheckResult> {
       };
     }
 
+    if (res.status === 404 || res.status === 405) {
+      return {
+        type: 'auth',
+        status: 'pass',
+        details: `Endpoint not found or method not allowed (${res.status}) — not publicly accessible`,
+        severity: 'low',
+      };
+    }
+
     if (res.ok) {
       const body = await res.text();
-      const hasUserData = body.includes('userId') || body.includes('email') || body.includes('wallet');
+      // Sprint 1 Fix: use tight regex patterns instead of naive substring search
+      const matchedPatterns = PRIVATE_FIELD_PATTERNS.filter(p => p.test(body));
+
+      if (matchedPatterns.length > 0) {
+        return {
+          type: 'auth',
+          status: 'fail',
+          details: `Endpoint returns user-private data WITHOUT authentication (matched: ${matchedPatterns.map(p => p.source.replace(/\\s\*:/i, '')).join(', ')})`,
+          severity: 'critical',
+        };
+      }
 
       return {
         type: 'auth',
-        status: hasUserData ? 'fail' : 'warn',
-        details: hasUserData
-          ? 'Endpoint returns user-specific data WITHOUT authentication'
-          : `Endpoint accessible without auth (${res.status}) but no obvious user data detected`,
-        severity: hasUserData ? 'critical' : 'medium',
+        status: 'warn',
+        details: `Endpoint accessible without auth (${res.status}) — no private fields detected, but verify manually`,
+        severity: 'medium',
       };
     }
 
@@ -149,16 +184,31 @@ async function checkSecurityHeaders(endpoint: string): Promise<SecurityCheckResu
   try {
     const res = await fetch(endpoint, { method: 'HEAD' });
     const issues: string[] = [];
+    const info: string[] = [];
 
+    // Required headers
     if (!res.headers.get('strict-transport-security')) issues.push('Missing HSTS');
     if (!res.headers.get('x-content-type-options')) issues.push('Missing X-Content-Type-Options');
     if (!res.headers.get('x-frame-options')) issues.push('Missing X-Frame-Options');
+    if (!res.headers.get('content-security-policy')) issues.push('Missing Content-Security-Policy');
+    if (!res.headers.get('referrer-policy')) issues.push('Missing Referrer-Policy');
+
+    // Disclosure headers that should NOT be present
+    const poweredBy = res.headers.get('x-powered-by');
+    if (poweredBy) issues.push(`x-powered-by exposes tech: "${poweredBy}"`);
+
+    const server = res.headers.get('server');
+    if (server && server.toLowerCase() !== 'vercel') {
+      info.push(`server header: "${server}"`);
+    }
 
     return {
       type: 'headers',
-      status: issues.length > 2 ? 'fail' : issues.length > 0 ? 'warn' : 'pass',
-      details: issues.length > 0 ? `Missing headers: ${issues.join(', ')}` : 'All security headers present',
-      severity: issues.length > 2 ? 'high' : issues.length > 0 ? 'medium' : 'low',
+      status: issues.length > 3 ? 'fail' : issues.length > 0 ? 'warn' : 'pass',
+      details: issues.length > 0
+        ? `Issues: ${issues.join(' | ')}`
+        : `All security headers present`,
+      severity: issues.length > 3 ? 'high' : issues.length > 0 ? 'medium' : 'low',
     };
   } catch (err) {
     return {
@@ -179,12 +229,14 @@ async function checkDataExposure(endpoint: string): Promise<SecurityCheckResult>
 
     const body = await res.text();
     const sensitivePatterns = [
-      { pattern: /password/i, label: 'password field' },
-      { pattern: /secret/i, label: 'secret field' },
-      { pattern: /private_key/i, label: 'private key' },
-      { pattern: /api_key/i, label: 'API key' },
-      { pattern: /token.*eyJ/i, label: 'JWT token' },
-      { pattern: /\b[A-Za-z0-9]{32,64}\b.*key/i, label: 'possible API key' },
+      { pattern: /"password"\s*:/i, label: 'password field' },
+      { pattern: /"secret"\s*:/i, label: 'secret field' },
+      { pattern: /"private_?key"\s*:/i, label: 'private key' },
+      { pattern: /"api_?key"\s*:/i, label: 'API key' },
+      { pattern: /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/i, label: 'JWT token' },
+      // Web3-specific: Solana private key is 88-char base58, seed phrase is 12/24 BIP-39 words
+      { pattern: /\b[1-9A-HJ-NP-Za-km-z]{87,88}\b/, label: 'possible Solana private key (base58)' },
+      { pattern: /\b(abandon|ability|able|about|above|absent|absorb|abstract|absurd|abuse|access|accident)\b.*\b(zoo|zone|zombie)\b/i, label: 'possible seed phrase' },
     ];
 
     const found = sensitivePatterns.filter(p => p.pattern.test(body));
@@ -201,7 +253,7 @@ async function checkDataExposure(endpoint: string): Promise<SecurityCheckResult>
     return {
       type: 'data-exposure',
       status: 'pass',
-      details: 'No obvious sensitive data patterns detected',
+      details: 'No sensitive data patterns detected',
       severity: 'low',
     };
   } catch (err) {
@@ -214,18 +266,70 @@ async function checkDataExposure(endpoint: string): Promise<SecurityCheckResult>
   }
 }
 
+// Sprint 1 Fix: Implement checkRateLimit — was declared in types but never built
+async function checkRateLimit(endpoint: string): Promise<SecurityCheckResult> {
+  try {
+    const BURST = 10;
+    const results: number[] = [];
+
+    // Fire 10 rapid sequential requests
+    for (let i = 0; i < BURST; i++) {
+      const res = await fetch(endpoint, {
+        method: 'GET',
+        signal: AbortSignal.timeout(5000),
+      });
+      results.push(res.status);
+    }
+
+    const has429 = results.includes(429);
+    const has503 = results.includes(503);
+    const allOk = results.every(s => s === 200 || s === 304);
+
+    if (has429 || has503) {
+      return {
+        type: 'rate-limit',
+        status: 'pass',
+        details: `Rate limiting active — got ${results.filter(s => s === 429 || s === 503).length}/${BURST} throttle responses`,
+        severity: 'low',
+      };
+    }
+
+    if (allOk) {
+      return {
+        type: 'rate-limit',
+        status: 'fail',
+        details: `No rate limiting detected — all ${BURST} rapid requests returned 200. Endpoint is susceptible to scraping and abuse.`,
+        severity: 'high',
+      };
+    }
+
+    return {
+      type: 'rate-limit',
+      status: 'warn',
+      details: `Mixed responses: ${results.join(', ')} — rate limiting may be partial`,
+      severity: 'medium',
+    };
+  } catch (err) {
+    return {
+      type: 'rate-limit',
+      status: 'warn',
+      details: `Could not check rate limit: ${err}`,
+      severity: 'medium',
+    };
+  }
+}
+
 // ============ Performance Benchmarker ============
 
 export async function benchmarkEndpoint(url: string): Promise<PerformanceResult> {
   const start = performance.now();
-  let ttfbTime = 0;
 
   try {
     const res = await fetch(url, {
       signal: AbortSignal.timeout(15000),
     });
 
-    ttfbTime = performance.now() - start;
+    const ttfbTime = performance.now() - start;
     const body = await res.text();
     const totalTime = performance.now() - start;
 
@@ -275,12 +379,15 @@ interface EndpointMapping {
   competitors: { name: string; endpoint: string }[];
 }
 
+// Sprint 1 Fix: Token Detail path corrected from /api/token/:address → /api/token?address=:address
+// Sprint 1 Fix: Added axiom.trade competitor for Token List
 const API_ENDPOINT_MAPPINGS: EndpointMapping[] = [
   {
     name: 'Token List',
     ourPath: '/api/token/list?limit=20',
     competitors: [
       { name: 'pump.fun', endpoint: 'https://frontend-api.pump.fun/coins?limit=20&sort=last_trade_unix_timestamp&includeNsfw=false' },
+      { name: 'axiom.trade', endpoint: 'https://api2.axiom.trade/solana/v2/tokens?limit=20&sortBy=volume24h' },
     ],
   },
   {
@@ -296,8 +403,10 @@ const API_ENDPOINT_MAPPINGS: EndpointMapping[] = [
     competitors: [],
   },
   {
+    // Sprint 1 Fix: was '/api/token/Ffyi2x1...' (wrong — path segment doesn't exist)
+    // Now using correct query-param format: /api/token?address=Ffyi2x1...
     name: 'Token Detail',
-    ourPath: '/api/token/Ffyi2x1EoPPsvBkU5siaodMunHniXSfQks9SDvGz83jD',
+    ourPath: '/api/token?address=Ffyi2x1EoPPsvBkU5siaodMunHniXSfQks9SDvGz83jD',
     competitors: [
       { name: 'pump.fun', endpoint: 'https://frontend-api.pump.fun/coins/Ffyi2x1EoPPsvBkU5siaodMunHniXSfQks9SDvGz83jD' },
     ],
@@ -308,7 +417,7 @@ async function sampleEndpoint(url: string): Promise<number> {
   const start = performance.now();
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    await res.text(); // consume body
+    await res.text();
     return Math.round(performance.now() - start);
   } catch {
     return -1;
@@ -411,7 +520,6 @@ export async function comparativeBehnchmark(
     }))
   );
 
-  // Compare against fastest competitor
   const fastestCompetitor = competitorResults
     .filter(c => c.result.responseTime > 0)
     .sort((a, b) => a.result.responseTime - b.result.responseTime)[0];

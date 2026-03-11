@@ -16,16 +16,15 @@ import {
 } from '@/lib/linear';
 import { formatSecurityComment } from '@/lib/ai';
 
+// Sprint 1 Fix: removed 5 non-existent endpoints that were causing false-pass results
+// Only real, verified endpoints on dev.bep.creator.fun
 const DEFAULT_ENDPOINTS = [
-  '/api/token',
-  '/api/watchlist',
-  '/api/user',
-  '/api/chat',
-  '/api/trade',
-  '/api/holdings',
+  '/api/token/list?limit=5',
+  '/api/token/search?q=test',
+  '/api/token?address=Ffyi2x1EoPPsvBkU5siaodMunHniXSfQks9SDvGz83jD',
   '/api/leaderboard',
+  '/api/leaderboard/stats',
   '/api/rewards',
-  '/api/fees',
 ];
 
 export async function POST(req: NextRequest) {
@@ -79,29 +78,43 @@ export async function POST(req: NextRequest) {
         }
 
         // ── Step 3: Check for duplicates / create new tickets ──
+        // Sprint 1 Fix: deduplicate by (check_type, endpoint_path) hash — not fuzzy title match.
+        // Old approach created 10 duplicate CORS tickets (CRX-871–880). This prevents that.
         send('step', { step: 2, status: 'active', label: 'Checking for duplicate tickets...' });
 
         const createdTickets: any[] = [];
         const existingTickets: any[] = [];
 
+        // Build findings list — one entry per (check_type × endpoint_path), severity critical or high only
         const criticalFindings = results
           .filter(r => r.overallStatus === 'fail')
-          .flatMap(r => r.checks
-            .filter((c: any) => c.status === 'fail' && (c.severity === 'critical' || c.severity === 'high'))
-            .map((c: any) => ({
-              title: `[Security][${c.severity.charAt(0).toUpperCase() + c.severity.slice(1)}] ${c.details.substring(0, 80)}`,
-              description: `## Security Finding\n\n**Endpoint:** ${r.endpoint}\n**Check:** ${c.type}\n**Severity:** ${c.severity.toUpperCase()}\n**Details:** ${c.details}\n\n---\n_Auto-created by QA Shield 🛡️_`,
-              detail: c.details,
-            }))
-          );
+          .flatMap(r => {
+            const epPath = r.endpoint.replace(/^https?:\/\/[^/]+/, '');
+            return r.checks
+              .filter((c: any) => c.status === 'fail' && (c.severity === 'critical' || c.severity === 'high'))
+              .map((c: any) => ({
+                // Dedup key: stable identifier per finding type + endpoint path
+                dedupKey: `${c.type}:${epPath.split('?')[0]}`,
+                title: `[Security][${c.severity.charAt(0).toUpperCase() + c.severity.slice(1)}] ${c.type.toUpperCase()} issue on ${epPath.split('?')[0]}`,
+                description: `## Security Finding\n\n**Endpoint:** \`${r.endpoint}\`\n**Check:** \`${c.type}\`\n**Severity:** ${c.severity.toUpperCase()}\n**Details:** ${c.details}\n\n---\n_Auto-created by QA Shield 🛡️_`,
+                detail: c.details,
+                checkType: c.type,
+                endpointPath: epPath.split('?')[0],
+              }));
+          });
 
-        // Deduplicate findings by title before checking Linear
-        const uniqueFindings = criticalFindings.filter((f, i, arr) =>
-          arr.findIndex(x => x.title === f.title) === i
-        );
+        // Sprint 1 Fix: deduplicate within this session by dedupKey first
+        const seenKeys = new Set<string>();
+        const uniqueFindings = criticalFindings.filter(f => {
+          if (seenKeys.has(f.dedupKey)) return false;
+          seenKeys.add(f.dedupKey);
+          return true;
+        });
 
         for (const finding of uniqueFindings) {
-          const existing = await findSimilarIssue(finding.title);
+          // Search for existing ticket by check_type + endpoint_path keywords (not fuzzy title)
+          const searchQuery = `${finding.checkType} ${finding.endpointPath}`;
+          const existing = await findSimilarIssue(searchQuery);
           if (existing) {
             existingTickets.push({
               identifier: existing.identifier,
@@ -139,7 +152,7 @@ export async function POST(req: NextRequest) {
           }
         }
 
-        send('step', { step: 2, status: 'done', label: `${createdTickets.length} new, ${existingTickets.length} existing` });
+        send('step', { step: 2, status: 'done', label: `${createdTickets.length} new, ${existingTickets.length} existing (${uniqueFindings.length} unique findings)` });
 
         send('complete', {
           success: true,
@@ -172,7 +185,7 @@ export async function GET() {
   const apiBase = process.env.STAGING_API_URL || 'https://dev.bep.creator.fun';
 
   const results = await Promise.all(
-    DEFAULT_ENDPOINTS.slice(0, 5).map(ep => scanEndpoint(`${apiBase}${ep}`))
+    DEFAULT_ENDPOINTS.slice(0, 6).map(ep => scanEndpoint(`${apiBase}${ep}`))
   );
 
   return NextResponse.json({
