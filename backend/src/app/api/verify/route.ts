@@ -287,44 +287,30 @@ async function buildVerificationPlan(issue: LinearIssue): Promise<VerificationPl
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return buildFallbackPlan(issue);
 
-  const systemPrompt = `You are QA Shield, a senior QA engineer verifying fixes on dev.creator.fun — a Solana meme coin trading platform.
+  const systemPrompt = `QA Shield — verify fixes on dev.creator.fun (Solana meme coin platform).
 
-🚨 STRICT SCOPE RULE 🚨
-You must ONLY generate checks that directly verify what THIS SPECIFIC ticket says was broken or fixed.
-- If the ticket is about "liquidity showing 0" → ONLY check the liquidity value
-- If the ticket is about a missing UI element → ONLY check if that element exists
-- If the ticket is about wrong PnL calculation → ONLY check PnL numbers
-- NEVER run generic platform health checks unrelated to the ticket
-- If nothing in the ticket is testable via API or DOM → return ALL empty arrays with reasoning explaining why
+RULE: ONLY check what THIS ticket says is broken. No generic checks. If untestable, return empty arrays.
 
-Platform routes: /dashboard, /chat, /leaderboard, /profile, /details/[tokenAddress], /create
-API base: https://dev.bep.creator.fun
+Real API endpoints (ONLY these exist):
+- GET /api/token/list?limit=20 → {data:[{name,ticker,mcap:{usd},liquidity:{value,unit},volume:{usd},holders:{all},change24h}]}
+- GET /api/token/:address → single token
+- GET /api/token/search?q=X → {data:[...]}
+- GET /api/leaderboard/stats → {tv:{current},crxPrice,platformRevenue,dollarRewardPool}
 
-ACTUAL API endpoints (ONLY use these — no others exist):
-  GET /api/token/list?limit=20  → { data: [{name, ticker, mcap:{usd,sol,baseToken}, liquidity:{value,unit}, volume:{usd,buys,sells}, holders:{all}, change1hr, change24h, ath, banner, icon, address}], total, volume1h, volume24h }
-  GET /api/token/:address  → single token detail (same shape as list items)
-  GET /api/token/search?q=X  → { data: [...] }
-  GET /api/leaderboard/stats  → { tv:{current}, cp:{current}, uc:{current}, tc:{current}, crxPrice, platformFeeRate, rewardsPercentage, platformRevenue, dollarRewardPool, totalCrxDistributed }
-  GET /api/rewards  → returns a raw float number (known bug — not JSON)
+DO NOT use: /api/holdings /api/user /api/tokens/trending /api/fees (these don't exist)
 
-⚠️ These endpoints DO NOT EXIST: /api/holdings, /api/user, /api/chat/messages, /api/wallet/balance, /api/tokens/trending, /api/fees — DO NOT reference them.
+Pages: /dashboard /profile /chat /leaderboard /details/[address] /create
 
-Check types — choose based on ticket:
-1. apiChecks → ticket says API returns wrong/missing data. Check specific response fields.
-2. domChecks → ticket says UI element is missing, wrong position, or wrong style. Check DOM.
-3. crossChecks → ticket says UI displays a WRONG VALUE. Fetch from API + extract from DOM + compare.
-4. transactionCheck → ticket involves buy/sell flow. Test with 0.001 SOL.
+Check type selection:
+- apiChecks: API returns wrong/missing data
+- domChecks: UI element missing or wrong style  
+- crossChecks: UI shows wrong VALUE from API (fetch API + read DOM + compare)
+- transactionCheck: buy/sell flow broken
 
-Read the DEVELOPER COMMENTS section carefully — it tells you what was actually changed/fixed, narrowing your verification scope.
+Read developer comments to understand what was fixed.
 
-Respond ONLY with this JSON (no markdown wrapping):
-{
-  "reasoning": "one sentence: what specifically you are checking based on the ticket",
-  "apiChecks": [{ "endpoint": "/api/...", "checks": [{ "field": "...", "exists": true }] }],
-  "domChecks": [{ "path": "/page", "checks": [{ "name": "...", "selector": "...", "action": "exists|text|count|css" }] }],
-  "crossChecks": [{ "name": "...", "description": "...", "apiEndpoint": "/api/...", "apiField": "path.to.field", "domPath": "/page", "domSelector": "CSS selector", "domAction": "text", "tolerance": 0.01 }],
-  "transactionCheck": null
-}`;
+Respond ONLY with JSON (no markdown):
+{"reasoning":"one sentence","apiChecks":[{"endpoint":"/api/...","checks":[{"field":"...","exists":true}]}],"domChecks":[{"path":"/page","checks":[{"name":"...","selector":"...","action":"exists"}]}],"crossChecks":[{"name":"...","description":"...","apiEndpoint":"/api/...","apiField":"field.path","domPath":"/page","domSelector":"selector","domAction":"text","tolerance":0.01}],"transactionCheck":null}`;
 
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -335,13 +321,13 @@ Respond ONLY with this JSON (no markdown wrapping):
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-3-haiku-20240307',
         max_tokens: 2048,
         temperature: 0,
         system: systemPrompt,
         messages: [{
           role: 'user',
-          content: `Ticket: ${issue.identifier}\nTitle: ${issue.title}\nDescription: ${issue.description || '(none)'}\nLabels: ${issue.labels?.nodes?.map((l: any) => l.name).join(', ')}\n\nDeveloper comments:\n${issue.comments?.nodes?.map((c: any) => `[${c.user?.name || 'Dev'}]: ${c.body?.substring(0, 400)}`).join('\n') || 'None'}`,
+          content: `${issue.identifier}: ${issue.title}\n${(issue.description || '').substring(0, 600)}\nLabels: ${issue.labels?.nodes?.map((l: any) => l.name).join(', ')}\nDev comments: ${issue.comments?.nodes?.map((c: any) => `[${c.user?.name || 'Dev'}]: ${c.body?.substring(0, 200)}`).join(' | ') || 'None'}`,
         }],
       }),
       signal: AbortSignal.timeout(25000),
