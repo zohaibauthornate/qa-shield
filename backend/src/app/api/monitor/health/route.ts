@@ -15,8 +15,10 @@ import {
   saveBaseline,
   generateMarkdownReport,
   saveReport,
+  concurrentLoadTest,
+  shouldFilePerformanceTicket,
 } from '@/lib/scanner';
-import type { ApiEndpointBenchmark, QAShieldReport } from '@/lib/scanner';
+import type { ApiEndpointBenchmark, QAShieldReport, ConcurrentLoadResult } from '@/lib/scanner';
 import {
   getIssueByIdentifier,
   addComment,
@@ -86,52 +88,103 @@ export async function POST(req: NextRequest) {
         send('step', { step: 2, status: regressedCount > 0 ? 'warn' : 'done', label: `Regression: ${regLabel}` });
         send('regression', { results: regressions });
 
-        // ── Step 4: WebSocket Benchmark ──
-        send('step', { step: 3, status: 'active', label: 'Testing WebSocket connection...' });
+        // ── Step 4: Concurrent Load Test ──
+        send('step', { step: 3, status: 'active', label: 'Running concurrent load test (3 parallel requests)...' });
+        const concurrentEndpoints = [
+          `${apiBase}/api/token/list?limit=20`,
+          `${apiBase}/api/token/search?q=test`,
+          `${apiBase}/api/token?address=Ffyi2x1EoPPsvBkU5siaodMunHniXSfQks9SDvGz83jD`,
+        ];
+        const loadResults: ConcurrentLoadResult[] = await concurrentLoadTest(concurrentEndpoints, 3);
+        const degradedCount = loadResults.filter(r => r.verdict === 'degraded').length;
+        send('step', {
+          step: 3,
+          status: degradedCount > 0 ? 'warn' : 'done',
+          label: `Load test: ${degradedCount > 0 ? `${degradedCount} endpoints degraded under concurrency` : 'All stable under concurrent load'}`,
+        });
+        send('load_test', { results: loadResults });
+
+        // ── Step 5: WebSocket Benchmark ──
+        send('step', { step: 4, status: 'active', label: 'Testing WebSocket connection...' });
         const wsResult = await benchmarkWebSocket();
         const wsLabel = wsResult.status === 'not_configured'
           ? 'WS not configured (set STAGING_WS_URL)'
           : wsResult.status === 'connected'
           ? `WS connected in ${wsResult.connectMs}ms, first msg ${wsResult.firstMessageMs}ms`
           : `WS ${wsResult.status}: ${wsResult.error}`;
-        send('step', { step: 3, status: wsResult.status === 'connected' ? 'done' : 'warn', label: wsLabel });
+        send('step', { step: 4, status: wsResult.status === 'connected' ? 'done' : 'warn', label: wsLabel });
         send('websocket', { result: wsResult });
 
-        // ── Step 5: Post to Linear ──
-        send('step', { step: 4, status: 'active', label: 'Posting to Linear...' });
+        // ── Step 6: Auto-file performance tickets ──
+        send('step', { step: 5, status: 'active', label: 'Checking performance thresholds for auto-ticketing...' });
+        const perfTickets: string[] = [];
+        const perfSkipped: string[] = [];
+
+        for (let i = 0; i < apiBenchmarks.length; i++) {
+          const decision = shouldFilePerformanceTicket(apiBenchmarks[i], regressions[i]);
+          if (decision.shouldFile) {
+            // Check for existing ticket before filing
+            const existing = await findSimilarIssue(`performance ${decision.endpoint}`);
+            if (existing) {
+              perfSkipped.push(existing.identifier);
+            } else {
+              try {
+                const ticket = await createIssue({
+                  title: `[Performance][${decision.severity.charAt(0).toUpperCase() + decision.severity.slice(1)}] ${decision.endpoint} endpoint significantly slower than competitors`,
+                  description: `## Performance Issue\n\n**Endpoint:** \`${apiBenchmarks[i].ourEndpoint}\`\n**Our Avg:** ${apiBenchmarks[i].ourAvg}ms\n**Competitor:** ${apiBenchmarks[i].competitorResults[0]?.name || 'N/A'} @ ${apiBenchmarks[i].competitorResults[0]?.avg || 'N/A'}ms\n**Delta:** ${decision.deltaPct > 0 ? '+' : ''}${decision.deltaPct}%\n\n**Reason:** ${decision.reason}\n\n---\n_Auto-filed by QA Shield 🛡️ Sprint 3 — performance auto-ticket_`,
+                  priority: decision.severity === 'critical' ? 1 : decision.severity === 'high' ? 2 : 3,
+                  labelIds: [LABELS.BUG],
+                });
+                perfTickets.push(ticket.identifier);
+                send('new_ticket', { identifier: ticket.identifier, title: ticket.title });
+              } catch (e) {
+                console.error('Failed to create perf ticket:', e);
+              }
+            }
+          }
+        }
+
+        send('step', {
+          step: 5,
+          status: 'done',
+          label: `Perf auto-ticket: ${perfTickets.length} filed, ${perfSkipped.length} existing (skipped)`,
+        });
+
+        // ── Step 7: Post to Linear ──
+        send('step', { step: 6, status: 'active', label: 'Posting benchmark comment to Linear...' });
         if (postComment && identifier) {
           try {
             const issue = await getIssueByIdentifier(identifier);
             const perfComment = formatPerformanceComment(apiBenchmarks, regressions, payloads);
             await addComment(issue.id, perfComment);
             send('linear_update', { type: 'performance', ticket: identifier, message: 'Performance comment posted' });
-            send('step', { step: 4, status: 'done', label: 'Linear comment posted' });
+            send('step', { step: 6, status: 'done', label: 'Linear comment posted' });
           } catch (e) {
             console.error('Failed to post perf comment:', e);
-            send('step', { step: 4, status: 'error', label: 'Failed to post comment' });
+            send('step', { step: 6, status: 'error', label: 'Failed to post comment' });
           }
         } else {
-          send('step', { step: 4, status: 'done', label: 'No ticket selected — skipped' });
+          send('step', { step: 6, status: 'done', label: 'No ticket selected — skipped' });
         }
 
-        // ── Step 6: Generate Report ──
-        send('step', { step: 5, status: 'active', label: 'Generating QA Shield report...' });
+        // ── Step 8: Generate Report ──
+        send('step', { step: 7, status: 'active', label: 'Generating QA Shield report...' });
         const report: QAShieldReport = {
           runId,
           timestamp: new Date().toISOString(),
           target: apiBase,
-          securitySummary: { passed: 0, warnings: 0, failed: 0, total: 0 }, // filled by security scan, not here
+          securitySummary: { passed: 0, warnings: 0, failed: 0, total: 0 },
           benchmarkSummary: { slower: slowerCount, total: totalWithComp },
           regressions,
           wsResult,
           payloads,
-          newTickets: [],
-          existingTickets: [],
+          newTickets: perfTickets,
+          existingTickets: perfSkipped,
           durationMs: Date.now() - runStart,
         };
         const reportContent = generateMarkdownReport(report);
         const reportPath = saveReport(report, reportContent);
-        send('step', { step: 5, status: 'done', label: `Report saved: ${reportPath ? reportPath.split('/').pop() : 'in-memory'}` });
+        send('step', { step: 7, status: 'done', label: `Report saved: ${reportPath ? reportPath.split('/').pop() : 'in-memory'}` });
         send('report', { runId, content: reportContent, path: reportPath });
 
         send('complete', {

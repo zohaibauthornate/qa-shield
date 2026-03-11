@@ -555,6 +555,151 @@ export async function comparativeBehnchmark(
   };
 }
 
+// ============ Sprint 3: Concurrent Load Test ============
+
+export interface ConcurrentLoadResult {
+  endpoint: string;
+  concurrency: number;
+  sequentialAvg: number;   // already known from apiLevelBenchmark
+  concurrentAvg: number;
+  degradationMs: number;
+  degradationPct: number;
+  verdict: 'stable' | 'degraded' | 'error';
+  errors: number;
+}
+
+export async function concurrentLoadTest(
+  endpoints: string[],
+  concurrency = 3
+): Promise<ConcurrentLoadResult[]> {
+  const results: ConcurrentLoadResult[] = [];
+  const baseline = loadBaseline();
+
+  for (const url of endpoints) {
+    const epPath = url.replace(/^https?:\/\/[^/]+/, '').split('?')[0];
+    const name = epPath.split('/').filter(Boolean).slice(-2).join('/');
+
+    // Fire `concurrency` requests simultaneously
+    const start = Date.now();
+    const promises = Array.from({ length: concurrency }, () =>
+      fetch(url, { signal: AbortSignal.timeout(10000) })
+        .then(async r => { await r.text(); return Date.now() - start; })
+        .catch(() => -1)
+    );
+
+    const timings = await Promise.all(promises);
+    const valid = timings.filter(t => t >= 0);
+    const errors = timings.filter(t => t < 0).length;
+    const concurrentAvg = valid.length > 0
+      ? Math.round(valid.reduce((a, b) => a + b, 0) / valid.length)
+      : -1;
+
+    // Find sequential baseline — use saved baseline or mark as unknown
+    const seqName = Object.keys(baseline).find(k =>
+      k.toLowerCase().includes(name.toLowerCase()) || name.includes(k.toLowerCase())
+    );
+    const sequentialAvg = seqName ? baseline[seqName] : -1;
+
+    let degradationMs = 0;
+    let degradationPct = 0;
+    let verdict: ConcurrentLoadResult['verdict'] = 'stable';
+
+    if (sequentialAvg > 0 && concurrentAvg > 0) {
+      degradationMs = concurrentAvg - sequentialAvg;
+      degradationPct = Math.round((degradationMs / sequentialAvg) * 100);
+      if (degradationPct > 50 || errors > 0) verdict = 'degraded';
+    }
+
+    if (errors === concurrency) verdict = 'error';
+
+    results.push({
+      endpoint: url.replace(/^https?:\/\/[^/]+/, ''),
+      concurrency,
+      sequentialAvg,
+      concurrentAvg,
+      degradationMs,
+      degradationPct,
+      verdict,
+      errors,
+    });
+  }
+
+  return results;
+}
+
+// ============ Sprint 3: Performance Auto-Ticket Decision ============
+
+export interface PerfTicketDecision {
+  endpoint: string;
+  shouldFile: boolean;
+  reason: string;
+  severity: 'critical' | 'high' | 'medium';
+  deltaPct: number;
+  regressionPct: number;
+}
+
+export function shouldFilePerformanceTicket(
+  benchmark: ApiEndpointBenchmark,
+  regression: RegressionResult | undefined
+): PerfTicketDecision {
+  const fastestComp = benchmark.competitorResults
+    .filter(c => c.avg >= 0)
+    .sort((a, b) => a.avg - b.avg)[0];
+
+  // Calculate percentage slower than fastest competitor
+  let deltaPct = 0;
+  if (fastestComp && benchmark.ourAvg > 0) {
+    deltaPct = Math.round(((benchmark.ourAvg - fastestComp.avg) / fastestComp.avg) * 100);
+  }
+
+  const regressionPct = regression?.deltaPct ?? 0;
+
+  // Tier 1: >2000% slower (>20x) — Critical
+  if (deltaPct > 2000) {
+    return {
+      endpoint: benchmark.name,
+      shouldFile: true,
+      reason: `${deltaPct}% slower than ${fastestComp?.name} (${benchmark.ourAvg}ms vs ${fastestComp?.avg}ms) — 20x+ threshold exceeded`,
+      severity: 'critical',
+      deltaPct,
+      regressionPct,
+    };
+  }
+
+  // Tier 2: >500% slower (>5x) — High
+  if (deltaPct > 500) {
+    return {
+      endpoint: benchmark.name,
+      shouldFile: true,
+      reason: `${deltaPct}% slower than ${fastestComp?.name} (${benchmark.ourAvg}ms vs ${fastestComp?.avg}ms) — 5x+ threshold exceeded`,
+      severity: 'high',
+      deltaPct,
+      regressionPct,
+    };
+  }
+
+  // Tier 3: >20% regression from baseline
+  if (regressionPct > 20 && regression?.verdict === 'regressed') {
+    return {
+      endpoint: benchmark.name,
+      shouldFile: true,
+      reason: `${regressionPct}% regression from last run (${regression.previousAvg}ms → ${regression.currentAvg}ms)`,
+      severity: 'medium',
+      deltaPct,
+      regressionPct,
+    };
+  }
+
+  return {
+    endpoint: benchmark.name,
+    shouldFile: false,
+    reason: 'Within acceptable thresholds',
+    severity: 'medium',
+    deltaPct,
+    regressionPct,
+  };
+}
+
 // ============ Sprint 2: Input Validation Check ============
 
 async function checkInputValidation(endpoint: string): Promise<SecurityCheckResult> {

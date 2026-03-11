@@ -15,6 +15,32 @@ import {
   LABELS,
 } from '@/lib/linear';
 import { formatSecurityComment } from '@/lib/ai';
+import * as fs from 'fs';
+import * as path from 'path';
+
+// Sprint 3 Fix: persistent dedup store — survives between scan runs in the same process
+// Stored as JSON on disk so it also survives server restarts
+const FILED_KEYS_PATH = path.join(process.cwd(), 'src', 'data', 'security-filed-keys.json');
+
+function loadFiledKeys(): Set<string> {
+  try {
+    if (fs.existsSync(FILED_KEYS_PATH)) {
+      const data = JSON.parse(fs.readFileSync(FILED_KEYS_PATH, 'utf8'));
+      return new Set<string>(Array.isArray(data) ? data : []);
+    }
+  } catch { /* ignore */ }
+  return new Set<string>();
+}
+
+function saveFiledKeys(keys: Set<string>): void {
+  try {
+    const dir = path.dirname(FILED_KEYS_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(FILED_KEYS_PATH, JSON.stringify([...keys], null, 2));
+  } catch (err) {
+    console.warn('Could not save filed keys:', err);
+  }
+}
 
 // Sprint 1 Fix: removed 5 non-existent endpoints that were causing false-pass results
 // Only real, verified endpoints on dev.bep.creator.fun
@@ -103,8 +129,11 @@ export async function POST(req: NextRequest) {
               }));
           });
 
-        // Sprint 1 Fix: deduplicate within this session by dedupKey first
-        const seenKeys = new Set<string>();
+        // Sprint 3 Fix: load persistent filed-keys to prevent cross-run duplicates
+        const persistedKeys = loadFiledKeys();
+
+        // Deduplicate within this session AND against previously filed keys
+        const seenKeys = new Set<string>(persistedKeys);
         const uniqueFindings = criticalFindings.filter(f => {
           if (seenKeys.has(f.dedupKey)) return false;
           seenKeys.add(f.dedupKey);
@@ -151,6 +180,9 @@ export async function POST(req: NextRequest) {
             }
           }
         }
+
+        // Sprint 3: persist the keys of all filed findings so next run skips them
+        saveFiledKeys(seenKeys);
 
         send('step', { step: 2, status: 'done', label: `${createdTickets.length} new, ${existingTickets.length} existing (${uniqueFindings.length} unique findings)` });
 
