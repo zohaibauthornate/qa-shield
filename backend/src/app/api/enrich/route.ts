@@ -6,6 +6,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getIssueByIdentifier, addComment } from '@/lib/linear';
 import { buildEnrichmentPrompt, formatEnrichmentAsComment, type TicketEnrichment } from '@/lib/ai';
+import { getTicketContext, formatGitHubContextForComment } from '@/lib/github';
 
 export const maxDuration = 120;
 
@@ -32,13 +33,28 @@ export async function POST(req: NextRequest) {
         if (!issue) throw new Error(`Issue ${identifier} not found`);
         send('step', { step: 0, status: 'done', label: issue.title.substring(0, 60) });
 
+        // ── Step 0b: Fetch GitHub context ──
+        send('step', { step: 0, status: 'active', label: 'Fetching GitHub commit context...' });
+        let githubCtx;
+        try {
+          githubCtx = await getTicketContext(identifier);
+          const ghLabel = githubCtx.hasChanges
+            ? `${githubCtx.commits.length} commit(s) found in [${githubCtx.repos.map(r => r.split('/')[1]).join(', ')}]`
+            : 'No commits on staging yet';
+          send('step', { step: 0, status: 'done', label: ghLabel });
+          send('github', { context: githubCtx });
+        } catch (ghErr) {
+          githubCtx = null;
+          send('step', { step: 0, status: 'done', label: 'GitHub context unavailable (skipped)' });
+        }
+
         // ── Step 1: AI analysis ──
         send('step', { step: 1, status: 'active', label: 'Analysing with AI...' });
 
         let enrichment: TicketEnrichment;
 
         if (process.env.ANTHROPIC_API_KEY) {
-          const prompt = buildEnrichmentPrompt(issue);
+          const prompt = buildEnrichmentPrompt(issue, githubCtx ?? undefined);
           const res = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: {
@@ -63,7 +79,7 @@ export async function POST(req: NextRequest) {
           enrichment = JSON.parse(jsonMatch[1].trim());
 
         } else if (process.env.OPENAI_API_KEY) {
-          const prompt = buildEnrichmentPrompt(issue);
+          const prompt = buildEnrichmentPrompt(issue, githubCtx ?? undefined);
           const { default: OpenAI } = await import('openai');
           const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
           const completion = await openai.chat.completions.create({
@@ -87,7 +103,11 @@ export async function POST(req: NextRequest) {
         let commentId: string | null = null;
         if (postComment) {
           send('step', { step: 2, status: 'active', label: 'Posting comment to Linear...' });
-          const commentBody = formatEnrichmentAsComment(enrichment);
+          let commentBody = formatEnrichmentAsComment(enrichment);
+          // Append GitHub context section if available
+          if (githubCtx) {
+            commentBody += '\n\n' + formatGitHubContextForComment(githubCtx);
+          }
           commentId = await addComment(issue.id, commentBody);
           send('step', { step: 2, status: 'done', label: 'Comment posted ✅' });
         } else {

@@ -16,6 +16,7 @@ import {
   type LinearIssue,
 } from '@/lib/linear';
 import { verifyAPI, verifyDOM, verifyQuickBuy, closeBrowser, type VerifyCheck } from '@/lib/verifier';
+import { getTicketContext, formatGitHubContextForComment, type GitHubContext } from '@/lib/github';
 
 export const maxDuration = 120;
 
@@ -45,9 +46,23 @@ export async function POST(req: NextRequest) {
         const issue = await getIssueByIdentifier(identifier);
         send('step', { step: 0, status: 'done', label: issue.title.substring(0, 60) });
 
+        // ── Step 1b: Fetch GitHub context ──
+        send('step', { step: 0, status: 'active', label: 'Fetching GitHub commit context...' });
+        let githubCtx: GitHubContext | null = null;
+        try {
+          githubCtx = await getTicketContext(identifier);
+          const ghLabel = githubCtx.hasChanges
+            ? `${githubCtx.commits.length} commit(s) — ${githubCtx.allFilesChanged.length} file(s) changed`
+            : 'No commits on staging yet';
+          send('step', { step: 0, status: 'done', label: ghLabel });
+          send('github', { context: githubCtx });
+        } catch (ghErr) {
+          send('step', { step: 0, status: 'done', label: 'GitHub context unavailable (skipped)' });
+        }
+
         // ── Step 2: AI generates verification plan ──
         send('step', { step: 1, status: 'active', label: 'Building verification plan...' });
-        const plan = await buildVerificationPlan(issue);
+        const plan = await buildVerificationPlan(issue, githubCtx ?? undefined);
         send('step', { step: 1, status: 'done', label: `${plan.apiChecks.length} API + ${plan.domChecks.length} DOM checks` });
         send('plan', plan);
 
@@ -135,7 +150,10 @@ export async function POST(req: NextRequest) {
 
         // ── Step 7: Post to Linear ──
         if (postComment) {
-          const comment = formatRealVerificationComment(issue, allChecks, verdict, plan);
+          let comment = formatRealVerificationComment(issue, allChecks, verdict, plan);
+          if (githubCtx) {
+            comment += '\n\n' + formatGitHubContextForComment(githubCtx);
+          }
           await addComment(issue.id, comment);
           send('linear_update', { type: 'comment', ticket: identifier, message: 'Verification comment posted' });
 
@@ -281,23 +299,44 @@ interface VerificationPlan {
   reasoning: string;
 }
 
-async function buildVerificationPlan(issue: LinearIssue): Promise<VerificationPlan> {
+async function buildVerificationPlan(issue: LinearIssue, githubCtx?: GitHubContext): Promise<VerificationPlan> {
   const emptyPlan: VerificationPlan = { apiChecks: [], domChecks: [], crossChecks: [], reasoning: '' };
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return buildFallbackPlan(issue);
 
+  // Build GitHub section for the prompt
+  let githubSection = '';
+  if (githubCtx?.hasChanges) {
+    githubSection = `\nGITHUB CHANGES (what the developer actually changed on staging):\n`;
+    githubSection += `Files changed: ${githubCtx.allFilesChanged.map(f => f.filename).join(', ')}\n`;
+    githubSection += `Impacted areas: ${githubCtx.impactedAreas.join(', ')}\n`;
+    // Add key diffs for precision
+    const filesWithPatches = githubCtx.allFilesChanged.filter(f => f.patch).slice(0, 2);
+    for (const file of filesWithPatches) {
+      githubSection += `\nDiff: ${file.filename}\n${file.patch!.substring(0, 600)}\n`;
+    }
+    githubSection += `\nUSE THESE FILE CHANGES to generate TARGETED checks. Focus verification on what actually changed.\n`;
+  } else if (githubCtx) {
+    githubSection = `\nGITHUB: No commits found on staging for this ticket. Fix may not be deployed.\n`;
+  }
+
   const systemPrompt = `QA Shield — verify fixes on dev.creator.fun (Solana meme coin platform).
 
-RULE: ONLY check what THIS ticket says is broken. No generic checks. If untestable, return empty arrays.
+STRICT SCOPE RULE: ONLY generate checks that directly verify what THIS specific ticket says was broken or fixed.
+If the ticket is about liquidity showing 0, ONLY check liquidity.
+If it is about a missing UI element, ONLY check that element exists and displays correctly.
+NEVER run generic platform health checks unrelated to the ticket.
+If nothing is testable via API or DOM, return empty arrays.
 
 Real API endpoints (ONLY these exist):
-- GET /api/token/list?limit=20 → {data:[{name,ticker,mcap:{usd},liquidity:{value,unit},volume:{usd},holders:{all},change24h}]}
-- GET /api/token/:address → single token
+- GET /api/token/list?limit=20 → {data:[{name,ticker,mcap:{usd,sol,baseToken},liquidity:{value,unit},volume:{usd,buys,sells},holders:{all},change1hr,change24h,ath,banner,icon,address}],total,volume1h,volume24h}
+- GET /api/token/:address → single token detail
 - GET /api/token/search?q=X → {data:[...]}
-- GET /api/leaderboard/stats → {tv:{current},crxPrice,platformRevenue,dollarRewardPool}
+- GET /api/leaderboard/stats → {tv:{current},crxPrice,platformFeeRate,rewardsPercentage,platformRevenue,dollarRewardPool,totalCrxDistributed}
+- GET /api/rewards → raw float number (known bug — returns raw number not JSON object)
 
-DO NOT use: /api/holdings /api/user /api/tokens/trending /api/fees (these don't exist)
+DO NOT use: /api/holdings /api/user /api/chat/messages /api/wallet/balance /api/tokens/trending — THESE DO NOT EXIST.
 
 Pages: /dashboard /profile /chat /leaderboard /details/[address] /create
 
@@ -307,7 +346,7 @@ Check type selection:
 - crossChecks: UI shows wrong VALUE from API (fetch API + read DOM + compare)
 - transactionCheck: buy/sell flow broken
 
-Read developer comments to understand what was fixed.
+Read developer comments AND GitHub changes to narrow scope.
 
 Respond ONLY with JSON (no markdown):
 {"reasoning":"one sentence","apiChecks":[{"endpoint":"/api/...","checks":[{"field":"...","exists":true}]}],"domChecks":[{"path":"/page","checks":[{"name":"...","selector":"...","action":"exists"}]}],"crossChecks":[{"name":"...","description":"...","apiEndpoint":"/api/...","apiField":"field.path","domPath":"/page","domSelector":"selector","domAction":"text","tolerance":0.01}],"transactionCheck":null}`;
@@ -321,13 +360,13 @@ Respond ONLY with JSON (no markdown):
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-3-haiku-20240307',
+        model: 'claude-sonnet-4-20250514',
         max_tokens: 2048,
         temperature: 0,
         system: systemPrompt,
         messages: [{
           role: 'user',
-          content: `${issue.identifier}: ${issue.title}\n${(issue.description || '').substring(0, 600)}\nLabels: ${issue.labels?.nodes?.map((l: any) => l.name).join(', ')}\nDev comments: ${issue.comments?.nodes?.map((c: any) => `[${c.user?.name || 'Dev'}]: ${c.body?.substring(0, 200)}`).join(' | ') || 'None'}`,
+          content: `${issue.identifier}: ${issue.title}\n${(issue.description || '').substring(0, 600)}\nLabels: ${issue.labels?.nodes?.map((l: any) => l.name).join(', ')}\nDeveloper comments: ${issue.comments?.nodes?.map((c: any) => `[${c.user?.name || 'Dev'}]: ${c.body?.substring(0, 400)}`).join('\n') || 'None'}${githubSection}`,
         }],
       }),
       signal: AbortSignal.timeout(25000),

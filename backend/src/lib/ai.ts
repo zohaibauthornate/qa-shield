@@ -4,6 +4,7 @@
  */
 
 import type { LinearIssue } from './linear';
+import { formatGitHubContextForAI, type GitHubContext } from './github';
 
 // ============ Types ============
 
@@ -112,11 +113,15 @@ Staging: https://dev.creator.fun (frontend), https://dev.bep.creator.fun (API)
 
 // ============ Enrichment Prompt ============
 
-export function buildEnrichmentPrompt(issue: LinearIssue): string {
+export function buildEnrichmentPrompt(issue: LinearIssue, githubCtx?: GitHubContext): string {
   const labels = issue.labels.nodes.map(l => l.name).join(', ');
   const existingComments = issue.comments.nodes
     .map(c => `[${c.user.name}]: ${c.body.substring(0, 300)}`)
     .join('\n');
+
+  const githubSection = githubCtx
+    ? `\n${formatGitHubContextForAI(githubCtx)}\n`
+    : '\nGITHUB CONTEXT: Not available.\n';
 
   return `${PLATFORM_CONTEXT}
 
@@ -134,6 +139,12 @@ STATE: ${issue.state.name}
 
 EXISTING COMMENTS:
 ${existingComments || 'None'}
+${githubSection}
+IMPORTANT: Use the GitHub context above to:
+1. Identify EXACTLY which files were changed and what was modified
+2. Suggest more precise regression areas based on the actual diff
+3. Generate test cases that verify the specific code changes made
+4. Identify files likely involved in the fix (use real filenames from the diff)
 
 Produce a JSON object with this EXACT structure:
 {
