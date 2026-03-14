@@ -39,7 +39,32 @@ const BRANCH = process.env.GITHUB_BRANCH || 'staging';
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN!;
 const STAGING_URL = process.env.STAGING_URL || 'https://dev.creator.fun';
 const STATE_FILE = '/tmp/qa-shield-commit-poll-state.json';
+const LOCK_FILE = '/tmp/qa-shield-poll.lock';
 const TICKET_REGEX = /\b(CRX-\d+)\b/gi;
+
+// ── Poll lock — prevents concurrent runs from double-processing commits ──
+async function acquireLock(): Promise<boolean> {
+  try {
+    const lockData = await fs.readFile(LOCK_FILE, 'utf8').catch(() => null);
+    if (lockData) {
+      const { pid, startedAt } = JSON.parse(lockData);
+      const ageMs = Date.now() - new Date(startedAt).getTime();
+      if (ageMs < 4 * 60 * 1000) { // lock valid for 4 min max
+        console.log(`[poll] Already running (pid ${pid}, ${Math.round(ageMs/1000)}s ago) — skipping`);
+        return false;
+      }
+      console.log(`[poll] Stale lock (${Math.round(ageMs/1000)}s) — overriding`);
+    }
+    await fs.writeFile(LOCK_FILE, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+    return true;
+  } catch {
+    return true; // if lock check fails, proceed anyway
+  }
+}
+
+async function releaseLock() {
+  await fs.unlink(LOCK_FILE).catch(() => {});
+}
 
 // ── State persistence ──
 interface PollState {
@@ -297,6 +322,13 @@ async function processCommit(
 }
 
 export async function POST(req: NextRequest) {
+  // ── Prevent concurrent runs ──
+  const locked = await acquireLock();
+  if (!locked) {
+    return NextResponse.json({ ok: true, skipped: true, reason: 'Already running' });
+  }
+
+  try {
   const state = await loadState();
   const results: any[] = [];
   let newCommitsFound = 0;
@@ -352,6 +384,7 @@ export async function POST(req: NextRequest) {
   }
 
   await saveState(state);
+  await releaseLock();
 
   return NextResponse.json({
     ok: true,
@@ -360,6 +393,11 @@ export async function POST(req: NextRequest) {
     results,
     timestamp: new Date().toISOString(),
   });
+  } catch (err: any) {
+    await releaseLock();
+    console.error('[poll] Fatal error:', err);
+    return NextResponse.json({ ok: false, error: err.message }, { status: 500 });
+  }
 }
 
 export async function GET() {
