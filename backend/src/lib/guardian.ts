@@ -626,6 +626,87 @@ function buildSummary(
   return s;
 }
 
+// ============ Commit-triggered ticket filing ============
+// Called by commit-runner after spotting security/perf issues in a specific commit.
+// Uses same deduplication + AI fix prompt as guardian scans.
+
+export interface CommitFinding {
+  type: 'security' | 'performance';
+  endpoint: string;
+  title: string;
+  description: string;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  // perf-specific
+  ourAvgMs?: number;
+  competitorAvgMs?: number;
+  competitorName?: string;
+  deltaPct?: number;
+}
+
+export async function fileCommitFindings(
+  findings: CommitFinding[],
+  commitSha: string,
+  ticketId?: string,
+): Promise<{ filed: string[]; skipped: number }> {
+  if (findings.length === 0) return { filed: [], skipped: 0 };
+
+  const state = loadState();
+  const filed: string[] = [];
+  let skipped = 0;
+  const shortSha = commitSha.slice(0, 7);
+
+  for (const f of findings) {
+    const fingerprint = makeFingerprint(f.type, f.endpoint, f.title);
+
+    // Skip already filed
+    const alreadyFiled = state.filedIssues.find(fi => fi.fingerprint === fingerprint && !fi.resolvedAt);
+    if (alreadyFiled) { skipped++; continue; }
+
+    // Check Linear for similar open ticket
+    try {
+      const similar = await findSimilarIssue(f.title);
+      if (similar && !['canceled', 'done'].includes(similar.state.name.toLowerCase())) {
+        state.filedIssues.push({ fingerprint, linearId: similar.identifier, title: similar.title, filedAt: new Date().toISOString(), severity: f.severity });
+        skipped++;
+        continue;
+      }
+    } catch { /* don't block */ }
+
+    // Build rich description
+    const contextLine = ticketId ? `\n> **Detected during commit [\`${shortSha}\`](https://github.com/creatorfun) on \`pre-staging\` — linked to ${ticketId}**\n` : `\n> **Detected during commit \`${shortSha}\` on \`pre-staging\`**\n`;
+
+    let description = f.description + contextLine;
+
+    if (f.type === 'performance' && f.ourAvgMs) {
+      description += `\n**Metrics:**\n- Our avg: ${f.ourAvgMs}ms\n- ${f.competitorName || 'Competitor'}: ${f.competitorAvgMs}ms\n- Delta: +${f.deltaPct}% slower\n\n**Industry Standard:** Under 200ms avg for API endpoints (Google/RAIL model). Under 100ms for critical trading endpoints.`;
+    }
+
+    try {
+      const priority = f.severity === 'critical' ? 1 : f.severity === 'high' ? 2 : 3;
+      const labelIds = f.type === 'security' ? [LABELS.SECURITY, LABELS.BUG] : [LABELS.BACKEND];
+
+      const issue = await createIssue({ title: f.title, description, priority, labelIds, stateId: WORKFLOW_STATES.TODO });
+
+      // Post AI fix prompt immediately
+      try {
+        const aiPrompt = buildAIFixPrompt(f.type, f.title, description, f.endpoint);
+        await addComment(issue.id, aiPrompt);
+      } catch { /* non-blocking */ }
+
+      state.filedIssues.push({ fingerprint, linearId: issue.identifier, title: issue.title, filedAt: new Date().toISOString(), severity: f.severity });
+      state.stats.totalIssuesFiled++;
+      if (f.severity === 'critical') state.stats.totalCriticalFound++;
+      filed.push(issue.identifier);
+      console.log(`[Guardian] Commit finding filed: ${issue.identifier} — ${f.title}`);
+    } catch (err: any) {
+      console.error(`[Guardian] Failed to file commit finding:`, err.message);
+    }
+  }
+
+  saveState(state);
+  return { filed, skipped };
+}
+
 // ============ State Reader (for status endpoint) ============
 
 export function getGuardianState(): GuardianState {

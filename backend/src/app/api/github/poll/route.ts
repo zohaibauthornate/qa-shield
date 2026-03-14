@@ -14,6 +14,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { promises as fs } from 'fs';
 import { runCommitAnalysis } from '@/lib/commit-runner';
+import { fileCommitFindings, type CommitFinding } from '@/lib/guardian';
+import { spawnCodexEnrich } from '@/lib/codex-background';
 import {
   getIssueByIdentifier,
   addComment,
@@ -22,6 +24,15 @@ import {
   WORKFLOW_STATES,
   LABELS,
 } from '@/lib/linear';
+
+// Industry performance standards (RAIL model + trading platform norms)
+const PERF_THRESHOLD_MS = 200;          // anything above this needs a ticket
+const PERF_CRITICAL_MS = 800;           // above this = critical severity
+const COMPETITORS = [
+  { name: 'pump.fun',     avgMs: 25 },
+  { name: 'axiom.trade',  avgMs: 45 },
+  { name: 'photon.trade', avgMs: 60 },
+];
 
 const REPOS = (process.env.GITHUB_REPOS || 'creatorfun/frontend,creatorfun/backend-persistent,creatorfun/backend-realtime').split(',');
 const BRANCH = process.env.GITHUB_BRANCH || 'staging';
@@ -169,6 +180,14 @@ async function processCommit(
       return { ticketId, verdict: 'skipped', error: 'Not found in Linear' };
     }
 
+    // ── Trigger async Codex enrichment (fire & forget — posts to Linear in ~90s) ──
+    try {
+      spawnCodexEnrich(ticketId, JSON.stringify(issue), JSON.stringify(null), true);
+      console.log(`[poll] Codex enrichment queued for ${ticketId}`);
+    } catch (enrichErr: any) {
+      console.warn(`[poll] Enrich spawn failed for ${ticketId}:`, enrichErr.message);
+    }
+
     // Auto-label QA-ReCheck + move to In Review
     try {
       await addLabel(issue.id, [LABELS.QA_RECHECK]);
@@ -198,17 +217,66 @@ async function processCommit(
       issue.description || undefined
     );
 
-    // Slack alert
+    // ── Extract + file security findings as separate Linear tickets ──
+    const commitFindings: CommitFinding[] = [];
+
+    for (const sec of result.secResults) {
+      for (const issue of sec.issues) {
+        const isCritical = issue.toLowerCase().includes('cors') || issue.toLowerCase().includes('auth');
+        commitFindings.push({
+          type: 'security',
+          endpoint: sec.endpoint,
+          title: `[Security] ${issue.split(':')[0].trim()} — ${sec.endpoint.replace('https://dev.bep.creator.fun', '')}`,
+          description: `**Security issue detected on \`pre-staging\` commit \`${commitSha.slice(0,7)}\`**\n\n**Endpoint:** \`${sec.endpoint}\`\n**Finding:** ${issue}\n\n**Steps to verify:**\n1. \`curl -H "Origin: https://evil-site.example.com" ${sec.endpoint}\`\n2. Check response headers for ACAO, HSTS, X-Content-Type-Options`,
+          severity: isCritical ? 'high' : 'medium',
+        });
+      }
+    }
+
+    // ── Extract + file performance findings vs industry standards ──
+    for (const perf of result.perfResults) {
+      if (perf.ourMs <= PERF_THRESHOLD_MS) continue; // within acceptable range
+      const fastest = COMPETITORS.sort((a, b) => a.avgMs - b.avgMs)[0];
+      const deltaPct = Math.round(((perf.ourMs - fastest.avgMs) / fastest.avgMs) * 100);
+      const severity = perf.ourMs >= PERF_CRITICAL_MS ? 'critical' : perf.ourMs >= 500 ? 'high' : 'medium';
+      const endpointPath = perf.endpoint.replace('https://dev.bep.creator.fun', '');
+
+      commitFindings.push({
+        type: 'performance',
+        endpoint: perf.endpoint,
+        title: `[Performance] ${endpointPath} — ${perf.ourMs}ms avg (${deltaPct}% slower than ${fastest.name})`,
+        description: `**Performance regression detected on \`pre-staging\`**\n\n**Endpoint:** \`${endpointPath}\`\n\n| Metric | Value |\n|--------|-------|\n| Our Avg Response | ${perf.ourMs}ms |\n| ${fastest.name} | ${fastest.avgMs}ms |\n| Delta | +${deltaPct}% slower |\n| Industry Standard | <200ms (RAIL model) |\n\n**Competitors for reference:**\n${COMPETITORS.map(c => `- ${c.name}: ~${c.avgMs}ms avg`).join('\n')}\n\n**Why this matters:** Trading platforms need sub-200ms API responses. Slow endpoints reduce user trust and increase bounce rate on key actions.`,
+        severity,
+        ourAvgMs: perf.ourMs,
+        competitorAvgMs: fastest.avgMs,
+        competitorName: fastest.name,
+        deltaPct,
+      });
+    }
+
+    // File all findings as separate Linear tickets (deduplicated)
+    if (commitFindings.length > 0) {
+      const { filed, skipped } = await fileCommitFindings(commitFindings, commitSha, ticketId);
+      if (filed.length > 0) {
+        console.log(`[poll] Filed ${filed.length} finding tickets: ${filed.join(', ')}`);
+      }
+      if (skipped > 0) {
+        console.log(`[poll] Skipped ${skipped} duplicate findings`);
+      }
+    }
+
+    // ── Slack alert ──
     const short = commitSha.slice(0, 7);
     const repoName = repo.split('/')[1];
     const commitUrl = `https://github.com/${repo}/commit/${commitSha}`;
     const verdictEmoji = result.verdict === 'pass' ? '✅' : result.verdict === 'fail' ? '❌' : '⚠️';
     const areasSummary = result.analysis.impactAreas.map(a => a.feature).slice(0, 3).join(', ');
+    const newTicketsStr = commitFindings.length > 0 ? `\n🎫 ${commitFindings.length} finding(s) filed as separate tickets` : '';
     const slackMsg = [
       `${verdictEmoji} *${ticketId}* commit-analysis *${result.verdict.toUpperCase()}*`,
       `Commit: <${commitUrl}|\`${short}\`> on \`${repoName}/${BRANCH}\``,
       `Impact: ${result.analysis.impactAreas.length} area(s) — ${areasSummary || 'none detected'}`,
-      `Checks: ${result.domResults.reduce((s, r) => s + r.passed, 0)}✓ DOM, ${result.apiResults.filter(r => r.ok).length}✓ API`,
+      `Checks: ${result.domResults.reduce((s, r) => s + r.passed, 0)}✓ DOM, ${result.apiResults.filter(r => r.ok).length}✓ API${newTicketsStr}`,
       `🔗 <${linearUrl}|View in Linear>`,
     ].join('\n');
     await slackAlert(slackMsg);
