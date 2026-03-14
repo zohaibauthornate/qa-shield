@@ -7,61 +7,32 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      width: 320px;
-      min-height: 400px;
+      width: 360px;
       background: #0f0f14;
       color: #e0e0e0;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       font-size: 13px;
     }
     .header {
-      padding: 16px;
+      padding: 14px 16px;
       background: #1a1a2e;
       border-bottom: 1px solid #2a2a3a;
       display: flex;
       align-items: center;
       gap: 8px;
     }
-    .header h1 { font-size: 16px; font-weight: 700; }
-    .header .logo { font-size: 24px; }
-    .content { padding: 16px; }
+    .header h1 { font-size: 16px; font-weight: 700; flex: 1; }
+    .header .logo { font-size: 22px; }
+    .header .badge {
+      font-size: 10px;
+      background: #2a2a4a;
+      color: #7c7cff;
+      padding: 2px 6px;
+      border-radius: 10px;
+    }
 
-    .status-card {
-      background: #16161e;
-      border-radius: 8px;
-      padding: 12px;
-      margin-bottom: 12px;
-    }
-    .status-card h3 { font-size: 12px; color: #888; text-transform: uppercase; margin-bottom: 8px; }
-    .status-indicator {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .status-dot {
-      width: 10px; height: 10px;
-      border-radius: 50%;
-      background: #22c55e;
-    }
-    .status-dot.warn { background: #eab308; }
-    .status-dot.error { background: #ef4444; }
-
-    .quick-actions { display: flex; flex-direction: column; gap: 6px; }
-    .action-btn {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 10px 12px;
-      background: #16161e;
-      border: 1px solid #2a2a3a;
-      border-radius: 6px;
-      color: #e0e0e0;
-      cursor: pointer;
-      font-size: 13px;
-      transition: background 0.2s;
-    }
-    .action-btn:hover { background: #22223a; }
-    .action-icon { font-size: 16px; }
+    /* ── Main View ── */
+    #main-view { padding: 14px; }
 
     .stats {
       display: grid;
@@ -78,17 +49,21 @@
     .stat-value { font-size: 20px; font-weight: 700; display: block; }
     .stat-label { font-size: 10px; color: #888; text-transform: uppercase; }
 
-    .footer {
-      padding: 12px 16px;
-      border-top: 1px solid #2a2a3a;
-      text-align: center;
-      color: #555;
-      font-size: 11px;
+    .status-card {
+      background: #16161e;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 10px;
     }
+    .status-card h3 { font-size: 11px; color: #888; text-transform: uppercase; margin-bottom: 6px; }
+    .status-indicator { display: flex; align-items: center; gap: 8px; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; flex-shrink: 0; }
+    .status-dot.warn { background: #eab308; }
+    .status-dot.error { background: #ef4444; }
 
     #api-url-input {
       width: 100%;
-      padding: 6px 8px;
+      padding: 5px 8px;
       background: #0f0f14;
       border: 1px solid #2a2a3a;
       border-radius: 4px;
@@ -96,61 +71,306 @@
       font-size: 12px;
       margin-top: 4px;
     }
+
+    .quick-actions { display: flex; flex-direction: column; gap: 6px; }
+    .action-btn {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      background: #16161e;
+      border: 1px solid #2a2a3a;
+      border-radius: 6px;
+      color: #e0e0e0;
+      cursor: pointer;
+      font-size: 13px;
+      transition: background 0.15s;
+      width: 100%;
+      text-align: left;
+    }
+    .action-btn:hover { background: #22223a; }
+    .action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .action-icon { font-size: 15px; flex-shrink: 0; }
+
+    /* Bulk Verify button — highlighted */
+    .action-btn.bulk-btn {
+      background: #1a2a1a;
+      border-color: #22c55e44;
+      color: #4ade80;
+      font-weight: 600;
+    }
+    .action-btn.bulk-btn:hover { background: #1e321e; }
+
+    /* ── Bulk Verify View ── */
+    #bulk-view {
+      display: none;
+      padding: 0;
+    }
+
+    .bulk-header {
+      padding: 12px 16px;
+      background: #16161e;
+      border-bottom: 1px solid #2a2a3a;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .bulk-header h2 { font-size: 14px; font-weight: 700; color: #4ade80; }
+    .back-btn {
+      background: none;
+      border: 1px solid #2a2a3a;
+      border-radius: 4px;
+      color: #888;
+      cursor: pointer;
+      padding: 3px 8px;
+      font-size: 11px;
+    }
+    .back-btn:hover { color: #e0e0e0; border-color: #444; }
+
+    .bulk-progress-bar-wrap {
+      height: 3px;
+      background: #1a1a2e;
+    }
+    .bulk-progress-bar-fill {
+      height: 3px;
+      background: #22c55e;
+      transition: width 0.3s ease;
+      width: 0%;
+    }
+
+    .bulk-summary {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+      padding: 10px 16px;
+      background: #0f0f14;
+    }
+    .bulk-stat {
+      text-align: center;
+      background: #16161e;
+      border-radius: 5px;
+      padding: 6px 4px;
+    }
+    .bulk-stat-val { font-size: 18px; font-weight: 700; display: block; }
+    .bulk-stat-label { font-size: 9px; color: #888; text-transform: uppercase; }
+    .bs-pass { color: #22c55e; }
+    .bs-fail { color: #ef4444; }
+    .bs-partial { color: #eab308; }
+    .bs-moved { color: #7c7cff; }
+
+    .bulk-status-line {
+      padding: 6px 16px;
+      font-size: 12px;
+      color: #888;
+      background: #0f0f14;
+      border-bottom: 1px solid #1a1a2e;
+      min-height: 28px;
+    }
+
+    .bulk-tickets {
+      max-height: 260px;
+      overflow-y: auto;
+      padding: 6px 0;
+    }
+    .bulk-tickets::-webkit-scrollbar { width: 4px; }
+    .bulk-tickets::-webkit-scrollbar-track { background: #0f0f14; }
+    .bulk-tickets::-webkit-scrollbar-thumb { background: #2a2a3a; border-radius: 2px; }
+
+    .ticket-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 16px;
+      border-bottom: 1px solid #1a1a2e;
+      transition: background 0.1s;
+    }
+    .ticket-row:last-child { border-bottom: none; }
+    .ticket-row.t-pending { opacity: 0.5; }
+    .ticket-row.t-running { background: #1a1a2e; }
+    .ticket-row.t-pass { }
+    .ticket-row.t-fail { background: #1a0a0a; }
+    .ticket-row.t-partial { background: #1a1600; }
+    .ticket-row.t-error { background: #1a0a0a; }
+
+    .t-icon { font-size: 14px; flex-shrink: 0; min-width: 16px; text-align: center; }
+    .t-id {
+      font-size: 11px;
+      font-weight: 600;
+      color: #7c7cff;
+      flex-shrink: 0;
+      min-width: 58px;
+    }
+    .t-title {
+      font-size: 11px;
+      color: #ccc;
+      flex: 1;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+    .t-checks {
+      font-size: 10px;
+      color: #888;
+      flex-shrink: 0;
+    }
+    .t-moved {
+      font-size: 10px;
+      color: #22c55e;
+      flex-shrink: 0;
+    }
+    .spin {
+      display: inline-block;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+    .bulk-actions {
+      padding: 10px 16px;
+      border-top: 1px solid #2a2a3a;
+      display: flex;
+      gap: 8px;
+    }
+    .bulk-run-btn {
+      flex: 1;
+      padding: 9px;
+      background: #1e321e;
+      border: 1px solid #22c55e55;
+      border-radius: 6px;
+      color: #4ade80;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .bulk-run-btn:hover { background: #233b23; }
+    .bulk-run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .filter-select {
+      padding: 8px;
+      background: #16161e;
+      border: 1px solid #2a2a3a;
+      border-radius: 6px;
+      color: #ccc;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .footer {
+      padding: 10px 16px;
+      border-top: 1px solid #2a2a3a;
+      text-align: center;
+      color: #444;
+      font-size: 11px;
+    }
   </style>
 </head>
 <body>
-  <div class="header">
-    <span class="logo">🛡️</span>
-    <h1>QA Shield</h1>
+
+  <!-- ── MAIN VIEW ── -->
+  <div id="main-view">
+    <div class="header">
+      <span class="logo">🛡️</span>
+      <h1>QA Shield</h1>
+      <span class="badge">v0.5</span>
+    </div>
+
+    <div style="padding:14px">
+      <div class="stats">
+        <div class="stat">
+          <span class="stat-value" id="scans-count">0</span>
+          <span class="stat-label">Scans</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="enriched-count">0</span>
+          <span class="stat-label">Enriched</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="issues-count">0</span>
+          <span class="stat-label">Issues</span>
+        </div>
+      </div>
+
+      <div class="status-card">
+        <h3>System Health</h3>
+        <div class="status-indicator" id="health-status">
+          <div class="status-dot" id="health-dot"></div>
+          <span id="health-text">Checking...</span>
+        </div>
+      </div>
+
+      <div class="status-card">
+        <h3>Backend API</h3>
+        <input type="text" id="api-url-input" value="http://localhost:3001" placeholder="Backend URL">
+      </div>
+
+      <div class="quick-actions">
+        <button class="action-btn bulk-btn" id="bulk-verify-open-btn">
+          <span class="action-icon">✅</span>
+          <span>Bulk Verify In Review</span>
+        </button>
+        <button class="action-btn" id="scan-all-btn">
+          <span class="action-icon">🔒</span>
+          <span>Run Full Security Scan</span>
+        </button>
+        <button class="action-btn" id="benchmark-btn">
+          <span class="action-icon">⚡</span>
+          <span>Performance Benchmark</span>
+        </button>
+        <button class="action-btn" id="health-btn">
+          <span class="action-icon">💓</span>
+          <span>Health Check</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="footer">QA Shield v0.5 — Creator.fun QA Automation</div>
   </div>
 
-  <div class="content">
-    <div class="stats">
-      <div class="stat">
-        <span class="stat-value" id="scans-count">0</span>
-        <span class="stat-label">Scans</span>
+  <!-- ── BULK VERIFY VIEW ── -->
+  <div id="bulk-view">
+    <div class="bulk-header">
+      <h2>✅ Bulk Verify</h2>
+      <button class="back-btn" id="bulk-back-btn">← Back</button>
+    </div>
+
+    <div class="bulk-progress-bar-wrap">
+      <div class="bulk-progress-bar-fill" id="bulk-progress-fill"></div>
+    </div>
+
+    <div class="bulk-summary">
+      <div class="bulk-stat">
+        <span class="bulk-stat-val bs-pass" id="bs-pass">0</span>
+        <span class="bulk-stat-label">Passed</span>
       </div>
-      <div class="stat">
-        <span class="stat-value" id="enriched-count">0</span>
-        <span class="stat-label">Enriched</span>
+      <div class="bulk-stat">
+        <span class="bulk-stat-val bs-fail" id="bs-fail">0</span>
+        <span class="bulk-stat-label">Failed</span>
       </div>
-      <div class="stat">
-        <span class="stat-value" id="issues-count">0</span>
-        <span class="stat-label">Issues</span>
+      <div class="bulk-stat">
+        <span class="bulk-stat-val bs-partial" id="bs-partial">0</span>
+        <span class="bulk-stat-label">Partial</span>
+      </div>
+      <div class="bulk-stat">
+        <span class="bulk-stat-val bs-moved" id="bs-moved">0</span>
+        <span class="bulk-stat-label">→ Done</span>
       </div>
     </div>
 
-    <div class="status-card">
-      <h3>System Health</h3>
-      <div class="status-indicator" id="health-status">
-        <div class="status-dot" id="health-dot"></div>
-        <span id="health-text">Checking...</span>
+    <div class="bulk-status-line" id="bulk-status-line">Ready to run.</div>
+
+    <div class="bulk-tickets" id="bulk-tickets">
+      <div style="text-align:center;padding:20px;color:#555">
+        Hit "Run" to fetch &amp; verify all In Review tickets
       </div>
     </div>
 
-    <div class="status-card">
-      <h3>Backend API</h3>
-      <input type="text" id="api-url-input" value="http://localhost:3000" placeholder="Backend URL">
+    <div class="bulk-actions">
+      <select class="filter-select" id="bulk-filter">
+        <option value="qa-recheck">QA-ReCheck only</option>
+        <option value="all">All In Review</option>
+      </select>
+      <button class="bulk-run-btn" id="bulk-run-btn">▶ Run</button>
     </div>
-
-    <div class="quick-actions">
-      <button class="action-btn" id="scan-all-btn">
-        <span class="action-icon">🔒</span>
-        <span>Run Full Security Scan</span>
-      </button>
-      <button class="action-btn" id="benchmark-btn">
-        <span class="action-icon">⚡</span>
-        <span>Performance Benchmark</span>
-      </button>
-      <button class="action-btn" id="health-btn">
-        <span class="action-icon">💓</span>
-        <span>Health Check</span>
-      </button>
-    </div>
-  </div>
-
-  <div class="footer">
-    QA Shield v0.1.0 — Creator.fun QA Automation
   </div>
 
   <script src="popup.js"></script>

@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "QA Shield",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Automated QA lifecycle — ticket enrichment, verification, security scanning & performance benchmarking",
   "permissions": ["activeTab", "storage", "tabs"],
   "host_permissions": [
     "https://linear.app/creatorfun/*",
     "https://dev.creator.fun/*",
     "https://dev.bep.creator.fun/*",
-    "http://localhost:3000/*"
+    "http://localhost:3000/*",
+    "http://localhost:3001/*"
   ],
   "action": {
     "default_popup": "popup/popup.html",

@@ -15,7 +15,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { promises as fs } from 'fs';
 import { runCommitAnalysis } from '@/lib/commit-runner';
 import { fileCommitFindings, type CommitFinding } from '@/lib/guardian';
-import { spawnCodexEnrich } from '@/lib/codex-background';
+import { spawnCodexEnrich, getJobByIdentifier } from '@/lib/codex-background';
 import {
   getIssueByIdentifier,
   addComment,
@@ -180,10 +180,15 @@ async function processCommit(
       return { ticketId, verdict: 'skipped', error: 'Not found in Linear' };
     }
 
-    // ── Trigger async Codex enrichment (fire & forget — posts to Linear in ~90s) ──
+    // ── Trigger async Codex enrichment — only once per ticket (skip if already done) ──
     try {
-      spawnCodexEnrich(ticketId, JSON.stringify(issue), JSON.stringify(null), true);
-      console.log(`[poll] Codex enrichment queued for ${ticketId}`);
+      const existingJob = getJobByIdentifier(ticketId);
+      if (existingJob && (existingJob.status === 'done' || existingJob.status === 'running' || existingJob.status === 'queued')) {
+        console.log(`[poll] Codex enrichment already ${existingJob.status} for ${ticketId} — skipping`);
+      } else {
+        spawnCodexEnrich(ticketId, JSON.stringify(issue), JSON.stringify(null), true);
+        console.log(`[poll] Codex enrichment queued for ${ticketId}`);
+      }
     } catch (enrichErr: any) {
       console.warn(`[poll] Enrich spawn failed for ${ticketId}:`, enrichErr.message);
     }
