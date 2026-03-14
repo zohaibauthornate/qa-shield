@@ -55,7 +55,6 @@ export async function POST(req: NextRequest) {
 
         let enrichment: TicketEnrichment;
 
-        const apiKeyValid = process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_API_KEY.startsWith('sk-ant-oat');
         const openaiKeyValid = !!process.env.OPENAI_API_KEY;
         const codexAvailable = await isCodexAvailable();
 
@@ -83,7 +82,7 @@ export async function POST(req: NextRequest) {
         // ── Try Chief QA AI proxy (Option B — no API key needed) ──
         const QA_BASE = `http://localhost:${process.env.PORT || 3000}`;
 
-        if (!apiKeyValid && !openaiKeyValid) {
+        if (!openaiKeyValid) {
           try {
             send('step', { step: 1, status: 'active', label: 'Routing to Chief QA AI proxy...' });
             const qRes = await fetch(`${QA_BASE}/api/ai/queue`, {
@@ -189,32 +188,7 @@ export async function POST(req: NextRequest) {
           }
         }
 
-        if (apiKeyValid) {
-          const prompt = buildEnrichmentPrompt(issue, githubCtx ?? undefined);
-          const res = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-api-key': process.env.ANTHROPIC_API_KEY!,
-              'anthropic-version': '2023-06-01',
-            },
-            body: JSON.stringify({
-              model: 'claude-sonnet-4-20250514',
-              max_tokens: 4096,
-              temperature: 0.2,
-              system: 'You are QA Shield, a senior QA automation engineer. Respond ONLY with valid JSON matching the exact structure requested. No markdown wrapping, no explanation — just the JSON object.',
-              messages: [{ role: 'user', content: prompt }],
-            }),
-          });
-
-          const aiResponse = await res.json();
-          if (aiResponse.error) throw new Error(aiResponse.error.message);
-
-          const content = aiResponse.content?.[0]?.text || '{}';
-          const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, content];
-          enrichment = JSON.parse(jsonMatch[1].trim());
-
-        } else if (openaiKeyValid) {
+        if (openaiKeyValid) {
           const prompt = buildEnrichmentPrompt(issue, githubCtx ?? undefined);
           const { default: OpenAI } = await import('openai');
           const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -228,7 +202,6 @@ export async function POST(req: NextRequest) {
             temperature: 0.2,
           });
           enrichment = JSON.parse(completion.choices[0].message.content || '{}');
-
         } else {
           enrichment = generateFallbackEnrichment(issue);
         }

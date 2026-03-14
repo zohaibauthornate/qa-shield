@@ -242,43 +242,8 @@ async function waitForAIResult(taskId: string, maxWaitMs = 90_000): Promise<unkn
 }
 
 async function buildVerificationPlan(issue: LinearIssue, githubCtx?: GitHubContext): Promise<VerificationPlan> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-
-  // If no valid API key, try the OpenClaw AI queue (Chief QA processes it)
-  if (!apiKey || apiKey.startsWith('sk-ant-oat')) {
-    try {
-      const queueRes = await fetch(`${QA_SHIELD_BASE}/api/ai/queue`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          type: 'verify-plan',
-          payload: {
-            identifier: issue.identifier,
-            title: issue.title,
-            description: (issue.description || '').slice(0, 1000),
-            files: githubCtx?.allFilesChanged?.map(f => f.filename) || [],
-            impactedAreas: githubCtx?.impactedAreas || [],
-          },
-        }),
-        signal: AbortSignal.timeout(5000),
-      });
-      if (queueRes.ok) {
-        const { taskId } = await queueRes.json();
-        console.log(`[verify-runner] Queued AI task ${taskId?.slice(0, 8)} for ${issue.identifier} — waiting for Chief QA...`);
-        const result = await waitForAIResult(taskId, 90_000);
-        if (result) {
-          const plan = result as VerificationPlan;
-          console.log(`[verify-runner] Got AI plan from Chief QA for ${issue.identifier}: ${plan.apiChecks?.length ?? 0} API, ${plan.domChecks?.length ?? 0} DOM checks`);
-          return plan;
-        }
-      }
-    } catch (queueErr: any) {
-      console.warn('[verify-runner] AI queue unavailable:', queueErr.message);
-    }
-    return buildFallbackPlan(issue);
-  }
-
-  if (!apiKey) return buildFallbackPlan(issue);
+  // AI priority: OpenAI API → Chief QA proxy → rule-based fallback
+  const openaiKey = process.env.OPENAI_API_KEY;
 
   let githubSection = '';
   if (githubCtx?.hasChanges) {
@@ -341,46 +306,65 @@ For visibility: use action:"visible" or action:"hidden".
 Respond ONLY with valid JSON (no markdown):
 {"reasoning":"1-2 sentences on what changed and what you're checking","apiChecks":[{"endpoint":"/api/path","checks":[{"field":"data.0.name","exists":true}]}],"domChecks":[{"path":"/correct-page","checks":[{"name":"Descriptive check name","selector":"CSS selector","action":"exists|text|visible|hidden|style"}]}],"crossChecks":[],"transactionCheck":null}`;
 
-  try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(apiKey.startsWith('sk-ant-oat') ? { 'Authorization': `Bearer ${apiKey}` } : { 'x-api-key': apiKey }),
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 2048,
+  const userContent = `TICKET: ${issue.identifier}: ${issue.title}\n\nDESCRIPTION:\n${(issue.description || 'No description').substring(0, 800)}\n\nLabels: ${issue.labels?.nodes?.map((l: any) => l.name).join(', ') || 'none'}\nDev comments: ${issue.comments?.nodes?.map((c: any) => `[${c.user?.name}]: ${c.body?.substring(0, 300)}`).join('\n') || 'None'}${githubSection}${diffContext}`;
+
+  // ── Try OpenAI API first (fast, ~10s) ──
+  if (openaiKey) {
+    try {
+      const { default: OpenAI } = await import('openai');
+      const openai = new OpenAI({ apiKey: openaiKey });
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userContent },
+        ],
+        response_format: { type: 'json_object' },
         temperature: 0,
-        system: systemPrompt,
-        messages: [{
-          role: 'user',
-          content: `TICKET: ${issue.identifier}: ${issue.title}\n\nDESCRIPTION:\n${(issue.description || 'No description').substring(0, 800)}\n\nLabels: ${issue.labels?.nodes?.map((l: any) => l.name).join(', ') || 'none'}\nDev comments: ${issue.comments?.nodes?.map((c: any) => `[${c.user?.name}]: ${c.body?.substring(0, 300)}`).join('\n') || 'None'}${githubSection}${diffContext}`,
-        }],
-      }),
-      signal: AbortSignal.timeout(25000),
-    });
-
-    const aiResp = await res.json();
-    if (aiResp.error) throw new Error(aiResp.error.message);
-
-    const raw = aiResp.content?.[0]?.text || '{}';
-    const jsonStr = raw.replace(/^```(?:json)?\s*/m, '').replace(/```\s*$/m, '').trim();
-    const parsed = JSON.parse(jsonStr);
-
-    return {
-      apiChecks: parsed.apiChecks || [],
-      domChecks: parsed.domChecks || [],
-      crossChecks: parsed.crossChecks || [],
-      transactionCheck: parsed.transactionCheck || undefined,
-      reasoning: parsed.reasoning || 'AI-generated verification plan',
-    };
-  } catch (err: any) {
-    console.error('[verify-runner] AI plan failed, fallback:', err.message);
-    return buildFallbackPlan(issue);
+      });
+      const parsed = JSON.parse(completion.choices[0].message.content || '{}');
+      return {
+        apiChecks: parsed.apiChecks || [],
+        domChecks: parsed.domChecks || [],
+        crossChecks: parsed.crossChecks || [],
+        transactionCheck: parsed.transactionCheck || undefined,
+        reasoning: parsed.reasoning || 'OpenAI-generated plan',
+      };
+    } catch (err: any) {
+      console.warn('[verify-runner] OpenAI failed, trying Chief QA proxy:', err.message);
+    }
   }
+
+  // ── Chief QA proxy (no API key needed) ──
+  try {
+    const queueRes = await fetch(`${QA_SHIELD_BASE}/api/ai/queue`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'verify-plan',
+        payload: {
+          identifier: issue.identifier,
+          title: issue.title,
+          description: (issue.description || '').slice(0, 1000),
+          files: githubCtx?.allFilesChanged?.map(f => f.filename) || [],
+          impactedAreas: githubCtx?.impactedAreas || [],
+        },
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (queueRes.ok) {
+      const { taskId } = await queueRes.json();
+      const result = await waitForAIResult(taskId, 90_000);
+      if (result) return result as VerificationPlan;
+    }
+  } catch (queueErr: any) {
+    console.warn('[verify-runner] Chief QA proxy unavailable:', queueErr.message);
+  }
+
+  return buildFallbackPlan(issue);
 }
+
+
 
 export function buildFallbackPlan(issue: LinearIssue): VerificationPlan {
   const combined = `${issue.title} ${issue.description || ''}`.toLowerCase();

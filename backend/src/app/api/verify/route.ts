@@ -328,8 +328,7 @@ interface VerificationPlan {
 }
 
 async function buildVerificationPlan(issue: LinearIssue, githubCtx?: GitHubContext): Promise<VerificationPlan> {
-  const anthropicKey = process.env.ANTHROPIC_API_KEY;
-  const apiKey = anthropicKey || ''; // don't bail early — try other AI engines first
+  // AI priority: OpenAI API → Codex CLI → rule-based fallback
 
   // Build GitHub section for the prompt
   let githubSection = '';
@@ -400,29 +399,6 @@ Respond ONLY with JSON (no markdown):
         temperature: 0,
       });
       parsed = JSON.parse(completion.choices[0].message.content || '{}');
-    } else if (anthropicKey && !anthropicKey.startsWith('sk-ant-oat')) {
-      // ── Anthropic API ──
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': anthropicKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 2048,
-          temperature: 0,
-          system: systemPrompt,
-          messages: [{ role: 'user', content: userContent }],
-        }),
-        signal: AbortSignal.timeout(25000),
-      });
-      const aiResp = await res.json();
-      if (aiResp.error) throw new Error(aiResp.error.message);
-      const raw = aiResp.content?.[0]?.text || '{}';
-      const jsonStr = raw.replace(/^```(?:json)?\s*/m, '').replace(/```\s*$/m, '').trim();
-      parsed = JSON.parse(jsonStr);
     } else if (codexAvailable) {
       // ── Codex CLI last resort (slow ~90s, but no API key needed) ──
       const codexPrompt = buildCodexVerifyPrompt(issue, githubCtx ?? undefined);
