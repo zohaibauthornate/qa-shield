@@ -145,11 +145,31 @@ export async function POST(req: NextRequest) {
         const warned = allChecks.filter(c => c.status === 'warn').length;
         const total = allChecks.length;
 
+        // ── VERDICT RULES (functional only — security/perf never affect this) ──
+        // cannot_verify: checks ran but couldn't execute (auth wall, DOM inaccessible, etc.)
+        // All warn/skip with 0 pass/fail = cannot verify, not a failure
+        // Only REAL functional failures (API wrong value, fix not applied) = fail
+        const cannotVerifyCount = allChecks.filter(c =>
+          c.status === 'warn' && (
+            c.details?.includes('auth') ||
+            c.details?.includes('login') ||
+            c.details?.includes('not found') ||
+            c.details?.includes('Browser worker') ||
+            c.details?.includes('Cannot navigate')
+          )
+        ).length;
+        const functionalFails = failed; // only hard API/data failures count
+
         let verdict: 'pass' | 'fail' | 'partial';
-        if (failed === 0 && passed > 0) verdict = 'pass';
-        else if (failed > 0 && passed === 0) verdict = 'fail';
-        else if (failed > 0) verdict = 'partial';
-        else verdict = 'partial'; // all skip/warn
+        if (total === 0 || (functionalFails === 0 && passed === 0 && warned > 0)) {
+          verdict = 'partial'; // cannot verify — no hard evidence either way
+        } else if (functionalFails === 0 && passed > 0) {
+          verdict = 'pass';   // fix confirmed working
+        } else if (functionalFails > 0 && passed === 0) {
+          verdict = 'fail';   // fix definitely not working
+        } else {
+          verdict = 'partial'; // mixed — some pass, some fail
+        }
 
         // ── Step 7: Post to Linear ──
         if (postComment) {
@@ -163,7 +183,12 @@ export async function POST(req: NextRequest) {
           if (verdict === 'pass') {
             await updateIssueState(issue.id, WORKFLOW_STATES.DONE);
             send('linear_update', { type: 'status', ticket: identifier, message: `✅ ${identifier} → Done` });
+          } else if (verdict === 'fail') {
+            // Only move to Todo on hard functional failure — not on partial/cannot_verify
+            await updateIssueState(issue.id, WORKFLOW_STATES.TODO);
+            send('linear_update', { type: 'status', ticket: identifier, message: `❌ ${identifier} → Todo (fix not working)` });
           }
+          // partial/cannot_verify: leave ticket in current state, just post the comment
         }
 
         send('step', { step: 5, status: 'done', label: verdict === 'pass' ? `✅ ${identifier} → Done` : `${verdict.toUpperCase()}: ${passed}✅ ${failed}❌ ${warned}⚠️` });
@@ -303,10 +328,8 @@ interface VerificationPlan {
 }
 
 async function buildVerificationPlan(issue: LinearIssue, githubCtx?: GitHubContext): Promise<VerificationPlan> {
-  const emptyPlan: VerificationPlan = { apiChecks: [], domChecks: [], crossChecks: [], reasoning: '' };
-
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return buildFallbackPlan(issue);
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = anthropicKey || ''; // don't bail early — try other AI engines first
 
   // Build GitHub section for the prompt
   let githubSection = '';
@@ -361,11 +384,9 @@ Respond ONLY with JSON (no markdown):
     let parsed: any;
     const codexAvailable = await isCodexAvailable();
 
-    if (codexAvailable) {
-      // ── Primary: Codex CLI (ChatGPT Plus — no API credits needed) ──
-      const codexPrompt = buildCodexVerifyPrompt(issue, githubCtx ?? undefined);
-      parsed = await callCodex(codexPrompt, 180_000);
-    } else if (openaiKey) {
+    // ── For verify, we need a FAST sync response to run actual checks.
+    // Priority: OpenAI API (fast) → Anthropic (fast) → Codex (slow, last resort)
+    if (openaiKey) {
       // ── Fallback: OpenAI API key ──
       const { default: OpenAI } = await import('openai');
       const openai = new OpenAI({ apiKey: openaiKey });
@@ -379,13 +400,13 @@ Respond ONLY with JSON (no markdown):
         temperature: 0,
       });
       parsed = JSON.parse(completion.choices[0].message.content || '{}');
-    } else {
-      // ── Last resort: Anthropic ──
+    } else if (anthropicKey && !anthropicKey.startsWith('sk-ant-oat')) {
+      // ── Anthropic API ──
       const res = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(apiKey.startsWith('sk-ant-oat') ? { 'Authorization': `Bearer ${apiKey}` } : { 'x-api-key': apiKey }),
+          'x-api-key': anthropicKey,
           'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
@@ -402,6 +423,13 @@ Respond ONLY with JSON (no markdown):
       const raw = aiResp.content?.[0]?.text || '{}';
       const jsonStr = raw.replace(/^```(?:json)?\s*/m, '').replace(/```\s*$/m, '').trim();
       parsed = JSON.parse(jsonStr);
+    } else if (codexAvailable) {
+      // ── Codex CLI last resort (slow ~90s, but no API key needed) ──
+      const codexPrompt = buildCodexVerifyPrompt(issue, githubCtx ?? undefined);
+      parsed = await callCodex(codexPrompt, 120_000);
+    } else {
+      // ── No AI available — use rule-based fallback ──
+      return buildFallbackPlan(issue);
     }
 
     return {
