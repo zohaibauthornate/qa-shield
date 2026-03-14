@@ -5,10 +5,12 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getIssueByIdentifier, addComment } from '@/lib/linear';
-import { buildEnrichmentPrompt, formatEnrichmentAsComment, type TicketEnrichment } from '@/lib/ai';
+import { buildEnrichmentPrompt, buildCodexEnrichmentPrompt, formatEnrichmentAsComment, type TicketEnrichment } from '@/lib/ai';
 import { getTicketContext, formatGitHubContextForComment } from '@/lib/github';
+import { callCodex, isCodexAvailable } from '@/lib/codex-ai';
+import { spawnCodexEnrich, getJobByIdentifier } from '@/lib/codex-background';
 
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 export async function POST(req: NextRequest) {
   const body = await req.json();
@@ -53,13 +55,147 @@ export async function POST(req: NextRequest) {
 
         let enrichment: TicketEnrichment;
 
-        if (process.env.ANTHROPIC_API_KEY) {
+        const apiKeyValid = process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_API_KEY.startsWith('sk-ant-oat');
+        const openaiKeyValid = !!process.env.OPENAI_API_KEY;
+        const codexAvailable = await isCodexAvailable();
+
+        // ── Primary: Codex CLI async (ChatGPT Plus — no API credits needed) ──
+        if (codexAvailable) {
+          const existingJob = getJobByIdentifier(identifier);
+          if (existingJob?.status === 'running' || existingJob?.status === 'queued') {
+            send('step', { step: 1, status: 'done', label: `Codex already running for ${identifier} (job ${existingJob.jobId})` });
+          } else {
+            const jobId = spawnCodexEnrich(
+              identifier,
+              JSON.stringify(issue),
+              JSON.stringify(githubCtx || null),
+              postComment,
+            );
+            send('step', { step: 1, status: 'done', label: `🚀 Codex analysis queued (job ${jobId}) — will post to Linear in ~2-3 min` });
+          }
+          send('step', { step: 2, status: 'done', label: postComment ? 'Comment will be posted by Codex when ready' : 'Skipped (postComment=false)' });
+          send('step', { step: 3, status: 'done', label: 'Returned immediately — Codex running in background' });
+          send('done', { success: true, identifier, queued: true, message: 'Codex is analyzing in background. Linear comment will appear in ~2-3 minutes.' });
+          controller.close();
+          return;
+        }
+
+        // ── Try Chief QA AI proxy (Option B — no API key needed) ──
+        const QA_BASE = `http://localhost:${process.env.PORT || 3000}`;
+
+        if (!apiKeyValid && !openaiKeyValid) {
+          try {
+            send('step', { step: 1, status: 'active', label: 'Routing to Chief QA AI proxy...' });
+            const qRes = await fetch(`${QA_BASE}/api/ai/queue`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                type: 'enrich',
+                payload: {
+                  identifier: issue.identifier,
+                  title: issue.title,
+                  description: (issue.description || '').slice(0, 1500),
+                  state: (issue as any).state?.name || '',
+                  priority: (issue as any).priority || 0,
+                  labels: ((issue as any).labels?.nodes || []).map((l: any) => l.name),
+                  githubContext: githubCtx ? {
+                    hasChanges: githubCtx.hasChanges,
+                    commitCount: githubCtx.commits?.length || 0,
+                    repos: githubCtx.repos,
+                    files: githubCtx.allFilesChanged?.slice(0, 10).map((f: any) => f.filename) || [],
+                  } : null,
+                },
+              }),
+              signal: AbortSignal.timeout(5000),
+            });
+
+            if (qRes.ok) {
+              const { taskId } = await qRes.json();
+              send('step', { step: 1, status: 'active', label: `AI task queued (${taskId?.slice(0, 8)}) — waiting for Chief QA...` });
+
+              // Poll up to 90s
+              const start = Date.now();
+              let aiResult: TicketEnrichment | null = null;
+              while (Date.now() - start < 90_000) {
+                await new Promise(r => setTimeout(r, 6000));
+                const poll = await fetch(`${QA_BASE}/api/ai/queue?taskId=${taskId}`, { signal: AbortSignal.timeout(5000) }).catch(() => null);
+                if (poll?.ok) {
+                  const task = await poll.json();
+                  if (task.status === 'done' && task.result) { aiResult = task.result; break; }
+                  if (task.status === 'failed') break;
+                }
+              }
+
+              if (aiResult) {
+                enrichment = aiResult;
+                send('step', { step: 1, status: 'done', label: `AI enrichment complete (Chief QA)` });
+                // Skip the direct API block below
+                goto_post_comment: {
+                  let commentId: string | null = null;
+                  if (postComment) {
+                    send('step', { step: 2, status: 'active', label: 'Posting comment to Linear...' });
+                    let commentBody = formatEnrichmentAsComment(enrichment);
+                    if (githubCtx) commentBody += '\n\n' + formatGitHubContextForComment(githubCtx);
+                    commentId = await addComment(issue.id, commentBody);
+                    send('step', { step: 2, status: 'done', label: 'Comment posted ✅' });
+                  } else {
+                    send('step', { step: 2, status: 'done', label: 'Skipped (postComment=false)' });
+                  }
+                  send('step', { step: 3, status: 'done', label: 'Enrichment complete' });
+                  send('done', { success: true, identifier, analysis: enrichment, commentId, commentPosted: !!commentId });
+                  controller.close();
+                  return;
+                }
+              } else {
+                send('step', { step: 1, status: 'active', label: 'AI proxy timed out — using fallback enrichment' });
+                enrichment = generateFallbackEnrichment(issue);
+              }
+            } else {
+              enrichment = generateFallbackEnrichment(issue);
+            }
+
+            // Jump to post-comment
+            let commentId2: string | null = null;
+            if (postComment) {
+              send('step', { step: 2, status: 'active', label: 'Posting comment to Linear...' });
+              let commentBody2 = formatEnrichmentAsComment(enrichment);
+              if (githubCtx) commentBody2 += '\n\n' + formatGitHubContextForComment(githubCtx);
+              commentId2 = await addComment(issue.id, commentBody2);
+              send('step', { step: 2, status: 'done', label: 'Comment posted ✅' });
+            } else {
+              send('step', { step: 2, status: 'done', label: 'Skipped (postComment=false)' });
+            }
+            send('step', { step: 3, status: 'done', label: 'Enrichment complete' });
+            send('done', { success: true, identifier, analysis: enrichment, commentId: commentId2, commentPosted: !!commentId2 });
+            controller.close();
+            return;
+
+          } catch (proxyErr: any) {
+            send('step', { step: 1, status: 'active', label: `AI proxy error: ${proxyErr.message} — using fallback` });
+            enrichment = generateFallbackEnrichment(issue);
+            // fall through to post comment
+            let cid: string | null = null;
+            if (postComment) {
+              send('step', { step: 2, status: 'active', label: 'Posting comment to Linear...' });
+              let cb = formatEnrichmentAsComment(enrichment);
+              if (githubCtx) cb += '\n\n' + formatGitHubContextForComment(githubCtx);
+              cid = await addComment(issue.id, cb);
+              send('step', { step: 2, status: 'done', label: 'Comment posted ✅' });
+            }
+            send('step', { step: 3, status: 'done', label: 'Enrichment complete (fallback)' });
+            send('done', { success: true, identifier, analysis: enrichment, commentPosted: !!cid });
+            controller.close();
+            return;
+          }
+        }
+
+        if (apiKeyValid) {
           const prompt = buildEnrichmentPrompt(issue, githubCtx ?? undefined);
           const res = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              'x-api-key': process.env.ANTHROPIC_API_KEY,
+              'x-api-key': process.env.ANTHROPIC_API_KEY!,
               'anthropic-version': '2023-06-01',
             },
             body: JSON.stringify({
@@ -78,7 +214,7 @@ export async function POST(req: NextRequest) {
           const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, content];
           enrichment = JSON.parse(jsonMatch[1].trim());
 
-        } else if (process.env.OPENAI_API_KEY) {
+        } else if (openaiKeyValid) {
           const prompt = buildEnrichmentPrompt(issue, githubCtx ?? undefined);
           const { default: OpenAI } = await import('openai');
           const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });

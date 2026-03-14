@@ -1,0 +1,183 @@
+/**
+ * Codex Runner Process — runs as a detached Node.js subprocess
+ * Reads job config from env vars, calls Codex, posts to Linear, updates job file.
+ *
+ * Run by codex-background.ts via spawn() with detached:true
+ */
+
+import { spawn } from 'child_process';
+import { execSync } from 'child_process';
+import fs from 'fs';
+
+const JOBS_FILE = '/tmp/qa-shield-codex-jobs.json';
+const LINEAR_API = 'https://api.linear.app/graphql';
+
+const {
+  QA_CODEX_JOB_ID: jobId,
+  QA_CODEX_IDENTIFIER: identifier,
+  QA_CODEX_ISSUE: issueJson,
+  QA_CODEX_GITHUB: githubJson,
+  QA_CODEX_POST_COMMENT: postCommentFlag,
+  LINEAR_API_KEY,
+  HOME,
+} = process.env;
+
+const postComment = postCommentFlag === '1';
+
+// ── Job state helpers ──────────────────────────────────────────────────────
+
+function readJobs() {
+  try { return JSON.parse(fs.readFileSync(JOBS_FILE, 'utf-8')); }
+  catch { return {}; }
+}
+
+function updateJob(patch) {
+  const jobs = readJobs();
+  if (jobs[jobId]) Object.assign(jobs[jobId], patch);
+  fs.writeFileSync(JOBS_FILE, JSON.stringify(jobs, null, 2));
+}
+
+// ── Linear helpers ─────────────────────────────────────────────────────────
+
+async function addLinearComment(issueId, body) {
+  const res = await fetch(LINEAR_API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: LINEAR_API_KEY },
+    body: JSON.stringify({
+      query: `mutation CreateComment($input: CommentCreateInput!) {
+        commentCreate(input: $input) { success comment { id } }
+      }`,
+      variables: { input: { issueId, body } },
+    }),
+  });
+  const data = await res.json();
+  return data?.data?.commentCreate?.comment?.id || null;
+}
+
+// ── Codex helper ───────────────────────────────────────────────────────────
+
+function callCodexSync(prompt) {
+  return new Promise((resolve, reject) => {
+    const codexPath = (() => {
+      try { return execSync('which codex').toString().trim(); } catch { return null; }
+    })();
+    if (!codexPath) return reject(new Error('codex not found'));
+
+    const child = spawn(codexPath, ['exec', '-'], {
+      env: { ...process.env, HOME },
+    });
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', d => { stdout += d.toString(); });
+    child.stderr.on('data', d => { stderr += d.toString(); });
+
+    const timer = setTimeout(() => { child.kill(); reject(new Error('Codex timed out')); }, 200_000);
+
+    child.on('close', () => {
+      clearTimeout(timer);
+      const sources = [stdout.trim(), stderr.trim(), (stdout + stderr).trim()];
+      for (const src of sources) {
+        if (!src) continue;
+        const start = src.indexOf('{');
+        const end = src.lastIndexOf('}');
+        if (start >= 0 && end > start) {
+          try {
+            resolve(JSON.parse(src.slice(start, end + 1)));
+            return;
+          } catch {}
+        }
+      }
+      reject(new Error(`No JSON in output. stdout: "${stdout.slice(0, 200)}"`));
+    });
+
+    child.on('error', reject);
+    child.stdin.write(prompt, 'utf-8');
+    child.stdin.end();
+  });
+}
+
+// ── Format enrichment as Linear comment ────────────────────────────────────
+
+function formatEnrichment(e) {
+  const typeEmoji = e.classification?.type === 'bug' ? '🐛' : e.classification?.type === 'improvement' ? '✨' : '🆕';
+  let c = `## 🛡️ QA Shield — Ticket Analysis (Codex)\n\n`;
+  c += `> ${typeEmoji} **${(e.classification?.type || 'unknown').toUpperCase()}** — ${e.classification?.reasoning || ''}\n\n`;
+  c += `### 🔍 What Went Wrong\n${e.whatWentWrong?.summary || ''}\n`;
+  c += `- **Root Cause:** ${e.whatWentWrong?.rootCause || ''}\n`;
+  c += `- **Component:** \`${e.whatWentWrong?.component || ''}\`\n\n`;
+  c += `### 📐 Impact\n- **Severity:** ${(e.impact?.severity || '').toUpperCase()}\n`;
+  c += `- **Scope:** ${e.impact?.scope || ''}\n\n`;
+  c += `### 🔄 Steps to Reproduce\n`;
+  (e.stepsToReproduce || []).forEach(s => { c += `${s}\n`; });
+  c += `\n**Expected:** ${e.expectedBehavior || ''}\n`;
+  c += `**Actual:** ${e.actualBehavior || ''}\n\n`;
+  c += `### 🛠️ Fix\n${e.recommendedFix?.approach || ''}\n`;
+  if ((e.recommendedFix?.filesLikelyInvolved || []).length > 0) {
+    c += `**Files:** ${e.recommendedFix.filesLikelyInvolved.map(f => `\`${f}\``).join(', ')}\n\n`;
+  }
+  c += `### ✅ Test Cases\n`;
+  (e.testCases || []).forEach(tc => {
+    const b = tc.priority === 'must' ? '🔴' : tc.priority === 'should' ? '🟡' : '🟢';
+    c += `**${b} ${tc.id}: ${tc.title}** [${tc.priority?.toUpperCase()}]\n`;
+    (tc.steps || []).forEach((s, i) => { c += `${i+1}. ${s}\n`; });
+    c += `**Expected:** ${tc.expected}\n\n`;
+  });
+  c += `---\n_Generated by QA Shield 🛡️ via Codex (async) at ${new Date().toISOString()}_`;
+  return c;
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────
+
+async function main() {
+  updateJob({ status: 'running' });
+
+  try {
+    const issue = JSON.parse(issueJson);
+    const githubCtx = githubJson ? JSON.parse(githubJson) : null;
+
+    const labels = (issue.labels?.nodes || []).map(l => l.name).join(', ');
+    const comments = (issue.comments?.nodes || []).slice(0, 2)
+      .map(c => `[${c.user?.name}]: ${c.body?.substring(0, 200)}`).join('\n');
+    const files = (githubCtx?.allFilesChanged || []).slice(0, 5)
+      .map(f => f.filename).join(', ') || 'none';
+
+    const prompt = `You are QA Shield, a senior QA engineer for Creator.fun (Solana meme coin trading platform).
+Analyze this Linear ticket and reply ONLY with a valid JSON object. No markdown, no explanation.
+
+TICKET: ${issue.identifier} — ${issue.title}
+DESCRIPTION: ${(issue.description || 'No description').substring(0, 500)}
+LABELS: ${labels || 'none'}
+COMMENTS: ${comments || 'none'}
+CHANGED FILES: ${files}
+
+Reply with this exact JSON structure:
+{"classification":{"type":"bug|improvement|feature","reasoning":"1 sentence"},"whatWentWrong":{"summary":"1-2 sentences","rootCause":"technical root cause","component":"component name","category":"error type"},"impact":{"severity":"critical|high|medium|low","scope":"who/what affected","affectedUsers":"who","affectedPages":["/page"],"affectedEndpoints":["/api/endpoint"],"financialImpact":false,"securityImpact":false},"stepsToReproduce":["1. step","2. step","3. step"],"expectedBehavior":"what should happen","actualBehavior":"what happens","recommendedFix":{"approach":"how to fix","filesLikelyInvolved":["file.tsx"],"estimatedEffort":"small|medium|large"},"testCases":[{"id":"TC-1","title":"verify fix","steps":["step1","step2"],"expected":"expected result","priority":"must|should|nice"}],"edgeCases":[{"id":"EC-1","scenario":"edge case","risk":"high|medium|low","howToTest":"how"}],"postFixVerification":["check 1","check 2"],"priorityRecommendation":{"level":"urgent|high|medium|low","reasoning":"why"}}`;
+
+    const enrichment = await callCodexSync(prompt);
+
+    let commentId = null;
+    if (postComment && issue.id) {
+      const commentBody = formatEnrichment(enrichment);
+      commentId = await addLinearComment(issue.id, commentBody);
+    }
+
+    updateJob({
+      status: 'done',
+      completedAt: new Date().toISOString(),
+      commentPosted: !!commentId,
+    });
+
+    console.log(`[codex-runner] ✅ Job ${jobId} done. Comment: ${commentId}`);
+
+  } catch (err) {
+    updateJob({
+      status: 'failed',
+      completedAt: new Date().toISOString(),
+      error: err.message,
+    });
+    console.error(`[codex-runner] ❌ Job ${jobId} failed:`, err.message);
+  }
+}
+
+main();

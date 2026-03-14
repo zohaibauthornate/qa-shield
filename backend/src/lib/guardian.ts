@@ -5,7 +5,7 @@
  */
 
 import { scanEndpoint, apiLevelBenchmark, shouldFilePerformanceTicket, type SecurityScanResult } from './scanner';
-import { createIssue, findSimilarIssue, LABELS, WORKFLOW_STATES } from './linear';
+import { createIssue, findSimilarIssue, addComment, LABELS, WORKFLOW_STATES } from './linear';
 import { getTicketContext } from './github';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -285,6 +285,20 @@ export async function runGuardianScan(options: {
         state.stats.totalIssuesFiled++;
         if (finding.severity === 'critical') state.stats.totalCriticalFound++;
 
+        // Post AI fix prompt as a comment — devs can copy-paste into Cursor/Claude Code
+        try {
+          const aiPrompt = buildAIFixPrompt(
+            finding.label as 'performance' | 'security',
+            finding.title,
+            finding.description,
+            finding.label === 'performance' ? (finding as any).endpoint : undefined
+          );
+          await addComment(issue.id, aiPrompt);
+          console.log(`[Guardian] AI fix prompt posted to ${issue.identifier}`);
+        } catch (promptErr) {
+          console.warn(`[Guardian] Could not post AI fix prompt for ${issue.identifier}:`, promptErr);
+        }
+
         console.log(`[Guardian] Filed: ${issue.identifier} — ${finding.title}`);
       } catch (err) {
         console.error(`[Guardian] Failed to file ticket for ${finding.fingerprint}:`, err);
@@ -373,31 +387,199 @@ ${getSecurityFix(check.type)}
 }
 
 function buildPerformanceDescription(
-  benchmark: { name: string; ourAvg: number; ourEndpoint?: string; competitorResults: { name: string; avg: number; endpoint: string }[] },
+  benchmark: {
+    name: string;
+    ourAvg: number;
+    ourEndpoint?: string;
+    samples?: number[];
+    competitorResults: { name: string; avg: number; endpoint: string; samples?: number[] }[];
+  },
   decision: { reason: string; deltaPct: number; severity: string }
 ): string {
-  const fastest = benchmark.competitorResults.filter(c => c.avg >= 0).sort((a, b) => a.avg - b.avg)[0];
-  return `## ⚡ Performance Issue — Auto-detected by QA Shield Guardian
+  const now = new Date().toISOString();
+  const validComps = benchmark.competitorResults.filter(c => c.avg >= 0).sort((a, b) => a.avg - b.avg);
+  const fastest = validComps[0];
+  const slowest = validComps[validComps.length - 1];
 
-**Endpoint:** \`${benchmark.name}\`
-**Our Avg Response:** ${benchmark.ourAvg}ms
-**Competitor (${fastest?.name || 'N/A'}):** ${fastest?.avg ?? 'N/A'}ms
-**Delta:** ${decision.deltaPct > 0 ? '+' : ''}${decision.deltaPct}% slower
+  // Waterfall comparison table
+  const allResults = [
+    { name: '🔴 Creator.fun (us)', avg: benchmark.ourAvg, samples: benchmark.samples },
+    ...validComps.map(c => ({ name: `✅ ${c.name}`, avg: c.avg, samples: c.samples })),
+  ].sort((a, b) => a.avg - b.avg);
 
-### Finding
-${decision.reason}
+  const tableRows = allResults.map(r => {
+    const pct = r.avg === benchmark.ourAvg && benchmark.ourAvg !== allResults[0].avg
+      ? ` (+${decision.deltaPct}%)`
+      : r.avg === allResults[0].avg ? ' (fastest)' : '';
+    const bar = '█'.repeat(Math.min(20, Math.round(r.avg / 100)));
+    return `| ${r.name} | **${r.avg}ms** | ${bar}${pct} |`;
+  }).join('\n');
 
-### Impact
-Users on slow connections will experience noticeable lag. In the meme coin trading space, every millisecond of latency costs trades.
+  // Percentile stats if samples available
+  let percentilesSection = '';
+  if (benchmark.samples && benchmark.samples.length > 1) {
+    const sorted = [...benchmark.samples].sort((a, b) => a - b);
+    const p50 = sorted[Math.floor(sorted.length * 0.5)];
+    const p95 = sorted[Math.floor(sorted.length * 0.95)] ?? sorted[sorted.length - 1];
+    const p99 = sorted[Math.floor(sorted.length * 0.99)] ?? sorted[sorted.length - 1];
+    percentilesSection = `\n### Latency Percentiles (Creator.fun)\n| P50 | P95 | P99 | Samples |\n|-----|-----|-----|------|\n| ${p50}ms | ${p95}ms | ${p99}ms | ${sorted.length} |\n`;
+  }
 
-### Suggested Fix
-- Add server-side caching (Redis/in-memory) for this endpoint
-- Review database query optimization
-- Consider CDN caching for static/semi-static responses
-- Profile the endpoint handler for N+1 queries
+  // Severity-based impact text
+  const impactMap: Record<string, string> = {
+    critical: '🚨 **Critical** — Users experience visible lag on every page load. In meme coin trading, a 500ms delay causes traders to miss price action and switch to faster platforms (Axiom, Pump.fun). This is directly costing trades.',
+    high: '⚠️ **High** — Noticeable slowness on active trading sessions. Users on mobile or slower connections will experience frustrating wait times.',
+    medium: '📊 **Medium** — Measurable performance gap vs competitors. While not blocking, this compounds with other latency sources and degrades perceived app quality.',
+  };
+
+  // Root cause hypotheses based on endpoint name
+  const epLower = benchmark.name.toLowerCase();
+  let rootCauseHypotheses = '';
+  if (epLower.includes('token') || epLower.includes('list')) {
+    rootCauseHypotheses = `
+**Likely root causes for token list endpoints:**
+1. **N+1 query** — fetching price/holder data per token in a loop instead of batching
+2. **No caching** — recalculating aggregates (market cap, volume) on every request
+3. **Missing DB index** — slow full-table scan on tokens table
+4. **Unoptimized joins** — joining orders + tokens + holders without proper indexes`;
+  } else if (epLower.includes('profile') || epLower.includes('user')) {
+    rootCauseHypotheses = `
+**Likely root causes for profile endpoints:**
+1. **On-chain RPC call** — fetching live balance from Helius/Solana RPC on every request
+2. **No caching of computed stats** — recalculating PnL/holdings on every page load
+3. **Large transaction history scan** — scanning all orders without pagination`;
+  } else {
+    rootCauseHypotheses = `
+**Likely root causes:**
+1. **No response caching** — identical requests recomputed on each call
+2. **Synchronous external calls** — waiting on RPC/price feed sequentially
+3. **Missing indexes** — unindexed query fields causing full table scans
+4. **Unoptimized aggregation** — heavy GROUP BY or COUNT queries without materialization`;
+  }
+
+  return `## ⚡ Performance Issue — Comprehensive Report
+
+> Auto-detected by **QA Shield Guardian** 🛡️ | ${now}
 
 ---
-*Auto-filed by QA Shield Guardian 🛡️ at ${new Date().toISOString()}*`;
+
+### Summary
+**Creator.fun is ${decision.deltaPct > 0 ? `${decision.deltaPct}% SLOWER` : 'on par'} than ${fastest?.name || 'competitors'}** on \`${benchmark.name}\`.
+
+| Platform | Avg Response | Speed Bar |
+|----------|-------------|-----------|
+${tableRows}
+${percentilesSection}
+### Severity: ${decision.severity.toUpperCase()}
+${impactMap[decision.severity] || impactMap.medium}
+
+---
+
+### Finding Detail
+${decision.reason}
+
+**Our endpoint:** \`${benchmark.ourEndpoint || benchmark.name}\`
+**Measured avg:** ${benchmark.ourAvg}ms
+**Fastest competitor:** ${fastest?.name || 'N/A'} at ${fastest?.avg ?? 'N/A'}ms
+**Slowest competitor:** ${slowest?.name || 'N/A'} at ${slowest?.avg ?? 'N/A'}ms
+${rootCauseHypotheses}
+
+---
+
+### Investigation Steps
+\`\`\`bash
+# 1. Measure current latency
+time curl -s "${benchmark.ourEndpoint || `https://dev.bep.creator.fun${benchmark.name}`}" -o /dev/null
+
+# 2. Check DB query time (add EXPLAIN ANALYZE in Prisma)
+# Find the route handler → add console.time() around Prisma calls
+
+# 3. Verify caching headers
+curl -si "${benchmark.ourEndpoint || `https://dev.bep.creator.fun${benchmark.name}`}" | grep -i "cache\\|etag\\|age"
+
+# 4. Compare vs competitors
+curl -s -o /dev/null -w "%{time_total}s" "${fastest?.endpoint || 'https://axiom.trade/api/tokens'}"
+\`\`\`
+
+### Recommended Fix
+1. **Add Redis/in-memory cache** for this endpoint (TTL: 5-30s depending on data freshness needs)
+2. **Batch database queries** — eliminate N+1 patterns
+3. **Add DB indexes** on frequently filtered/sorted columns
+4. **Profile with \`EXPLAIN ANALYZE\`** — identify slow queries
+5. **Consider CDN caching** for public/semi-static responses
+
+---
+*Auto-filed by QA Shield Guardian 🛡️*`;
+}
+
+// ── Build AI fix prompt for any ticket type ──
+function buildAIFixPrompt(
+  type: 'performance' | 'security',
+  title: string,
+  description: string,
+  endpoint?: string
+): string {
+  if (type === 'performance') {
+    return `## 🤖 AI Fix Prompt — Copy into Cursor / Claude Code
+
+\`\`\`
+You are a senior Node.js/TypeScript backend engineer working on Creator.fun — a Solana meme coin trading platform.
+
+PERFORMANCE ISSUE: ${title}
+
+${endpoint ? `SLOW ENDPOINT: ${endpoint}` : ''}
+
+TASK:
+1. Find the route handler for this endpoint in the backend-persistent Express/Prisma codebase
+2. Identify the root cause: N+1 queries, missing DB indexes, no caching, sync RPC calls
+3. Add Redis caching using the existing cache utility (TTL appropriate to data freshness)
+4. If N+1: rewrite to use Prisma's include/select batching or a single aggregated query
+5. Add EXPLAIN ANALYZE comments for any slow Prisma queries
+6. Ensure the fix does not break existing response shape (same fields, same types)
+7. Add a brief comment explaining what was optimized and why
+
+Target: reduce response time to under 200ms average (currently: ${description.match(/Our Avg Response: (\d+)ms/)?.[1] || '500+'}ms)
+
+Files to check first:
+- src/modules/ — route handlers
+- src/lib/cache.ts or similar — existing cache utility
+- prisma/schema.prisma — check indexes on relevant models
+
+Do NOT: change authentication, modify response shape, add new dependencies without checking package.json first.
+\`\`\`
+
+---
+*Paste this prompt directly into Cursor AI, Claude Code, or GitHub Copilot Chat to get a targeted fix.*`;
+  }
+
+  return `## 🤖 AI Fix Prompt — Copy into Cursor / Claude Code
+
+\`\`\`
+You are a senior security engineer reviewing Creator.fun — a Solana meme coin trading platform built with Express.js/TypeScript.
+
+SECURITY ISSUE: ${title}
+
+${endpoint ? `VULNERABLE ENDPOINT: ${endpoint}` : ''}
+
+TASK:
+1. Find this endpoint/middleware in the backend-persistent codebase
+2. Implement the exact security fix described below
+3. Do NOT break existing functionality or change the response shape
+4. Add a test case or curl command showing the fix works
+
+ISSUE DETAILS:
+${description.split('\n').slice(0, 8).join('\n')}
+
+Files to check first:
+- src/middleware/ — auth, CORS, rate limiting middleware
+- src/modules/ — route handlers
+- src/app.ts or index.ts — global middleware setup
+
+Do NOT: remove authentication from any other endpoints, introduce new security vulnerabilities, or change the database schema.
+\`\`\`
+
+---
+*Paste this prompt directly into Cursor AI, Claude Code, or GitHub Copilot Chat to get a targeted fix.*`;
 }
 
 function getSecurityContext(type: string): string {

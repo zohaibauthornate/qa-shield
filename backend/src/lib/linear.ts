@@ -211,6 +211,30 @@ export async function findSimilarIssue(titleKeywords: string): Promise<LinearIss
 
 // ============ Team Queries ============
 
+export async function getInReviewTickets(limit = 50): Promise<LinearIssue[]> {
+  const { teamId } = getConfig();
+  const data = await linearQuery(`
+    query InReviewIssues($teamId: String!, $stateId: ID!, $limit: Int!) {
+      team(id: $teamId) {
+        issues(
+          first: $limit,
+          orderBy: updatedAt,
+          filter: { state: { id: { eq: $stateId } } }
+        ) {
+          nodes {
+            id identifier title description priority url createdAt updatedAt
+            state { id name type }
+            assignee { id name email }
+            labels { nodes { id name } }
+            comments { nodes { id body createdAt user { name } } }
+          }
+        }
+      }
+    }
+  `, { teamId, stateId: WORKFLOW_STATES.IN_REVIEW, limit });
+  return data.team.issues.nodes;
+}
+
 export async function getTeamIssues(stateFilter?: string, limit = 50) {
   const { teamId } = getConfig();
   const stateClause = stateFilter ? `, filter: { state: { name: { eq: "${stateFilter}" } } }` : '';

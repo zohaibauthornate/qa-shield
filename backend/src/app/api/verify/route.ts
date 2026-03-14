@@ -17,8 +17,11 @@ import {
 } from '@/lib/linear';
 import { verifyAPI, verifyDOM, verifyQuickBuy, closeBrowser, type VerifyCheck } from '@/lib/verifier';
 import { getTicketContext, formatGitHubContextForComment, type GitHubContext } from '@/lib/github';
+import { formatVerificationComment as formatVerificationCommentShared } from '@/lib/verify-runner';
+import { callCodex, isCodexAvailable } from '@/lib/codex-ai';
+import { buildCodexVerifyPrompt } from '@/lib/ai';
 
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 const STAGING_URL = process.env.STAGING_URL || 'https://dev.creator.fun';
 
@@ -352,32 +355,54 @@ Respond ONLY with JSON (no markdown):
 {"reasoning":"one sentence","apiChecks":[{"endpoint":"/api/...","checks":[{"field":"...","exists":true}]}],"domChecks":[{"path":"/page","checks":[{"name":"...","selector":"...","action":"exists"}]}],"crossChecks":[{"name":"...","description":"...","apiEndpoint":"/api/...","apiField":"field.path","domPath":"/page","domSelector":"selector","domAction":"text","tolerance":0.01}],"transactionCheck":null}`;
 
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 2048,
+    const openaiKey = process.env.OPENAI_API_KEY;
+    const userContent = `${issue.identifier}: ${issue.title}\n${(issue.description || '').substring(0, 600)}\nLabels: ${issue.labels?.nodes?.map((l: any) => l.name).join(', ')}\nDeveloper comments: ${issue.comments?.nodes?.map((c: any) => `[${c.user?.name || 'Dev'}]: ${c.body?.substring(0, 400)}`).join('\n') || 'None'}${githubSection}`;
+
+    let parsed: any;
+    const codexAvailable = await isCodexAvailable();
+
+    if (codexAvailable) {
+      // ── Primary: Codex CLI (ChatGPT Plus — no API credits needed) ──
+      const codexPrompt = buildCodexVerifyPrompt(issue, githubCtx ?? undefined);
+      parsed = await callCodex(codexPrompt, 180_000);
+    } else if (openaiKey) {
+      // ── Fallback: OpenAI API key ──
+      const { default: OpenAI } = await import('openai');
+      const openai = new OpenAI({ apiKey: openaiKey });
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userContent },
+        ],
+        response_format: { type: 'json_object' },
         temperature: 0,
-        system: systemPrompt,
-        messages: [{
-          role: 'user',
-          content: `${issue.identifier}: ${issue.title}\n${(issue.description || '').substring(0, 600)}\nLabels: ${issue.labels?.nodes?.map((l: any) => l.name).join(', ')}\nDeveloper comments: ${issue.comments?.nodes?.map((c: any) => `[${c.user?.name || 'Dev'}]: ${c.body?.substring(0, 400)}`).join('\n') || 'None'}${githubSection}`,
-        }],
-      }),
-      signal: AbortSignal.timeout(25000),
-    });
-
-    const aiResp = await res.json();
-    if (aiResp.error) throw new Error(aiResp.error.message);
-
-    const raw = aiResp.content?.[0]?.text || '{}';
-    const jsonStr = raw.replace(/^```(?:json)?\s*/m, '').replace(/```\s*$/m, '').trim();
-    const parsed = JSON.parse(jsonStr);
+      });
+      parsed = JSON.parse(completion.choices[0].message.content || '{}');
+    } else {
+      // ── Last resort: Anthropic ──
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(apiKey.startsWith('sk-ant-oat') ? { 'Authorization': `Bearer ${apiKey}` } : { 'x-api-key': apiKey }),
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 2048,
+          temperature: 0,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: userContent }],
+        }),
+        signal: AbortSignal.timeout(25000),
+      });
+      const aiResp = await res.json();
+      if (aiResp.error) throw new Error(aiResp.error.message);
+      const raw = aiResp.content?.[0]?.text || '{}';
+      const jsonStr = raw.replace(/^```(?:json)?\s*/m, '').replace(/```\s*$/m, '').trim();
+      parsed = JSON.parse(jsonStr);
+    }
 
     return {
       apiChecks: parsed.apiChecks || [],
@@ -393,71 +418,18 @@ Respond ONLY with JSON (no markdown):
 }
 
 // ── Regex fallback (only used when AI is unavailable) ──
+// buildFallbackPlan now lives in verify-runner.ts (shared with bulk verify)
+// Imported and re-exported here for use in this file
+import { buildFallbackPlan as buildFallbackPlanShared } from '@/lib/verify-runner';
 function buildFallbackPlan(issue: LinearIssue): VerificationPlan {
-  const title = issue.title.toLowerCase();
-  const desc = (issue.description || '').toLowerCase();
-  const combined = `${title} ${desc}`;
-
-  const plan: VerificationPlan = { apiChecks: [], domChecks: [], crossChecks: [], reasoning: '' };
-
-  if (combined.includes('leaderboard')) {
-    plan.apiChecks.push({ endpoint: '/api/leaderboard/stats', checks: [{ field: 'tv', exists: true }, { field: 'crxPrice', exists: true }] });
-    plan.domChecks.push({ path: '/leaderboard', checks: [{ name: 'Leaderboard page loads', selector: 'main', action: 'exists' }] });
-    plan.reasoning = 'Leaderboard ticket — checking leaderboard/stats API + page DOM';
-  } else if (combined.includes('liquidity') || combined.includes('mcap') || combined.includes('market cap') || combined.includes('volume') || combined.includes('holders')) {
-    plan.apiChecks.push({ endpoint: '/api/token/list?limit=5', checks: [{ field: 'data', type: 'array' }, { field: 'data', minLength: 1 }] });
-    plan.reasoning = 'Token data ticket — checking token list API for relevant fields';
-  } else if (combined.includes('balance') || combined.includes('chat') || combined.includes('pill')) {
-    plan.domChecks.push({ path: '/chat', checks: [{ name: 'Chat page loads', selector: 'main', action: 'exists' }] });
-    plan.reasoning = 'Chat/balance ticket — checking chat page DOM';
-  } else if (combined.includes('settings') || combined.includes('404')) {
-    plan.domChecks.push({ path: '/settings', checks: [{ name: 'Settings page loads (no 404)', selector: 'main', action: 'exists' }] });
-    plan.reasoning = 'Settings/404 ticket — checking page renders without error';
-  } else {
-    // No specific scope detected — don't run irrelevant generic checks
-    plan.reasoning = 'Ticket scope unclear — no automatable checks could be derived from the title/description. Manual verification required.';
-  }
-
-  return plan;
+  return buildFallbackPlanShared(issue);
 }
-// ============ Format Comment ============
-
+// formatRealVerificationComment → now using shared formatVerificationComment from verify-runner.ts
 function formatRealVerificationComment(
   issue: { identifier: string; title: string },
   checks: VerifyCheck[],
   verdict: string,
   plan: VerificationPlan
 ): string {
-  const verdictIcon = verdict === 'pass' ? '✅' : verdict === 'fail' ? '❌' : '⚠️';
-  const verdictText = verdict === 'pass' ? 'VERIFIED — PASSED' : verdict === 'fail' ? 'VERIFIED — FAILED' : 'PARTIAL VERIFICATION';
-
-  const passed = checks.filter(c => c.status === 'pass');
-  const failed = checks.filter(c => c.status === 'fail');
-  const warned = checks.filter(c => c.status === 'warn');
-
-  let c = `## ${verdictIcon} ${verdictText}\n\n`;
-  c += `**${issue.identifier}** — ${issue.title}\n\n`;
-  c += `**Strategy:** ${plan.reasoning}\n`;
-  c += `**Results:** ${passed.length}✅ ${failed.length}❌ ${warned.length}⚠️ / ${checks.length} total\n\n`;
-
-  if (passed.length > 0) {
-    c += `### ✅ Passed\n`;
-    passed.forEach(ch => { c += `- **${ch.name}** — ${ch.details}\n`; });
-    c += '\n';
-  }
-
-  if (failed.length > 0) {
-    c += `### ❌ Failed\n`;
-    failed.forEach(ch => { c += `- **${ch.name}** — ${ch.details}\n`; });
-    c += '\n';
-  }
-
-  if (warned.length > 0) {
-    c += `### ⚠️ Warnings\n`;
-    warned.forEach(ch => { c += `- **${ch.name}** — ${ch.details}\n`; });
-    c += '\n';
-  }
-
-  c += `---\n_Verified by QA Shield 🛡️ via real browser + API testing at ${new Date().toISOString()}_`;
-  return c;
+  return formatVerificationCommentShared(issue, checks, verdict, plan);
 }

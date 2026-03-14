@@ -111,6 +111,52 @@ Tech Stack: Next.js + React + TypeScript + TailwindCSS frontend, Node.js APIs, S
 Staging: https://dev.creator.fun (frontend), https://dev.bep.creator.fun (API)
 `;
 
+// ============ Compact Codex Prompt (for Codex CLI — gpt-5.4 reasoning model) ============
+// Kept short to stay under 90s response time
+
+export function buildCodexEnrichmentPrompt(issue: LinearIssue, githubCtx?: GitHubContext): string {
+  const labels = issue.labels.nodes.map(l => l.name).join(', ');
+  const comments = issue.comments.nodes
+    .slice(0, 2)
+    .map(c => `[${c.user.name}]: ${c.body.substring(0, 200)}`)
+    .join('\n');
+  const files = githubCtx?.allFilesChanged?.slice(0, 5).map((f: any) => f.filename).join(', ') || 'none';
+
+  return `You are QA Shield, a senior QA engineer for Creator.fun (Solana meme coin trading platform).
+Analyze this Linear ticket and reply ONLY with a valid JSON object. No markdown, no explanation.
+
+TICKET: ${issue.identifier} — ${issue.title}
+DESCRIPTION: ${(issue.description || 'No description').substring(0, 500)}
+LABELS: ${labels || 'none'}
+COMMENTS: ${comments || 'none'}
+CHANGED FILES: ${files}
+
+Reply with this exact JSON structure:
+{"classification":{"type":"bug|improvement|feature","reasoning":"1 sentence"},"whatWentWrong":{"summary":"1-2 sentences","rootCause":"technical root cause","component":"component name","category":"logic error|UI inconsistency|missing validation|etc"},"impact":{"severity":"critical|high|medium|low","scope":"who/what affected","affectedUsers":"who","affectedPages":["/page"],"affectedEndpoints":["/api/endpoint"],"financialImpact":false,"securityImpact":false},"stepsToReproduce":["1. step","2. step","3. step"],"expectedBehavior":"what should happen","actualBehavior":"what happens","recommendedFix":{"approach":"how to fix","filesLikelyInvolved":["file.tsx"],"estimatedEffort":"small|medium|large"},"testCases":[{"id":"TC-1","title":"verify fix","steps":["step1","step2"],"expected":"expected result","priority":"must|should|nice"}],"edgeCases":[{"id":"EC-1","scenario":"edge case","risk":"high|medium|low","howToTest":"how"}],"postFixVerification":["check 1","check 2"],"priorityRecommendation":{"level":"urgent|high|medium|low","reasoning":"why"}}`;
+}
+
+export function buildCodexVerifyPrompt(issue: LinearIssue, githubCtx?: GitHubContext): string {
+  const comments = issue.comments.nodes
+    .slice(0, 3)
+    .map(c => `[${c.user.name}]: ${c.body.substring(0, 300)}`)
+    .join('\n');
+  const files = githubCtx?.allFilesChanged?.slice(0, 5).map((f: any) => f.filename).join(', ') || 'none';
+
+  return `QA Shield — verify fix on dev.creator.fun (Solana meme coin platform).
+
+TICKET: ${issue.identifier} — ${issue.title}
+DESCRIPTION: ${(issue.description || '').substring(0, 400)}
+LABELS: ${issue.labels.nodes.map(l => l.name).join(', ') || 'none'}
+COMMENTS: ${comments || 'none'}
+CHANGED FILES: ${files}
+
+Generate ONLY checks that verify THIS specific ticket fix. Reply with ONLY JSON:
+{"reasoning":"1 sentence","apiChecks":[{"endpoint":"/api/...","checks":[{"field":"fieldName","exists":true}]}],"domChecks":[{"path":"/page","checks":[{"name":"check name","selector":"css selector","action":"exists|text|visible"}]}],"crossChecks":[],"transactionCheck":null}
+
+Available real API endpoints: GET /api/token/list?limit=20, GET /api/token/:address, GET /api/leaderboard/stats
+Real pages: /dashboard /profile /chat /leaderboard /details/[address] /create`;
+}
+
 // ============ Enrichment Prompt ============
 
 export function buildEnrichmentPrompt(issue: LinearIssue, githubCtx?: GitHubContext): string {

@@ -1,0 +1,669 @@
+/**
+ * verify-runner.ts — Core ticket verification logic (shared by single + bulk routes)
+ * Extracted from /api/verify/route.ts to allow reuse in /api/verify/bulk
+ */
+
+import {
+  addComment,
+  updateIssueState,
+  WORKFLOW_STATES,
+  type LinearIssue,
+} from '@/lib/linear';
+import { verifyAPI, verifyDOM, verifyQuickBuy, type VerifyCheck } from '@/lib/verifier';
+import { getTicketContext, formatGitHubContextForComment, type GitHubContext } from '@/lib/github';
+
+const STAGING_API_BASE = process.env.STAGING_API_URL || 'https://dev.bep.creator.fun';
+const BROWSER_WORKER = process.env.BROWSER_WORKER_URL || 'http://127.0.0.1:3099';
+
+// ============ Types ============
+
+export interface VerifyTicketResult {
+  identifier: string;
+  title: string;
+  verdict: 'pass' | 'fail' | 'partial';
+  checks: VerifyCheck[];
+  summary: { passed: number; failed: number; warned: number; total: number };
+  movedToDone: boolean;
+  commentPosted: boolean;
+  failureScreenshots?: string[]; // base64 JPEGs
+  error?: string;
+}
+
+export interface CrossCheck {
+  name: string;
+  apiEndpoint: string;
+  apiField: string;
+  domPath: string;
+  domSelector: string;
+  domAction?: string;
+  tolerance?: number;
+  description: string;
+}
+
+export interface VerificationPlan {
+  apiChecks: { endpoint: string; checks: any[] }[];
+  domChecks: { path: string; checks: any[] }[];
+  crossChecks: CrossCheck[];
+  transactionCheck?: { tokenAddress: string; amount: number };
+  reasoning: string;
+}
+
+// ============ Main Runner ============
+
+export async function runVerification(
+  issue: LinearIssue,
+  options: { postComment?: boolean; moveToDone?: boolean } = {}
+): Promise<VerifyTicketResult> {
+  const { postComment = true, moveToDone = true } = options;
+
+  try {
+    // Fetch GitHub context
+    let githubCtx: GitHubContext | null = null;
+    try {
+      githubCtx = await getTicketContext(issue.identifier);
+    } catch {
+      // Skip if unavailable
+    }
+
+    // Build verification plan
+    const plan = await buildVerificationPlan(issue, githubCtx ?? undefined);
+    const allChecks: VerifyCheck[] = [];
+
+    // API checks (parallel)
+    if (plan.apiChecks.length > 0) {
+      const apiResultGroups = await Promise.all(
+        plan.apiChecks.map(apiCheck => verifyAPI(apiCheck.endpoint, apiCheck.checks))
+      );
+      for (const results of apiResultGroups) allChecks.push(...results);
+    }
+
+    // DOM checks (sequential — browser worker)
+    const failureScreenshots: string[] = []; // base64 JPEGs from failed pages
+    if (plan.domChecks.length > 0) {
+      for (const domGroup of plan.domChecks) {
+        const { checks: domResults, screenshot } = await verifyDOM(domGroup.path, domGroup.checks);
+        allChecks.push(...domResults);
+        // Capture screenshot if any check on this page failed
+        if (screenshot && domResults.some(c => c.status === 'fail')) {
+          failureScreenshots.push(screenshot);
+        }
+      }
+    }
+
+    // Cross-checks
+    if (plan.crossChecks?.length > 0) {
+      for (const cc of plan.crossChecks) {
+        const result = await runCrossCheck(cc);
+        allChecks.push(result);
+      }
+    }
+
+    // Transaction check
+    if (plan.transactionCheck) {
+      const txResults = await verifyQuickBuy(
+        plan.transactionCheck.tokenAddress,
+        plan.transactionCheck.amount || 0.001
+      );
+      allChecks.push(...txResults);
+    }
+
+    // Verdict
+    const passed = allChecks.filter(c => c.status === 'pass').length;
+    const failed = allChecks.filter(c => c.status === 'fail').length;
+    const warned = allChecks.filter(c => c.status === 'warn').length;
+    const total = allChecks.length;
+
+    let verdict: 'pass' | 'fail' | 'partial';
+    if (failed === 0 && passed > 0) verdict = 'pass';
+    else if (failed > 0 && passed === 0) verdict = 'fail';
+    else if (failed > 0) verdict = 'partial';
+    else verdict = 'partial';
+
+    let commentPosted = false;
+    let movedToDone = false;
+
+    if (postComment) {
+      let comment = formatVerificationComment(issue, allChecks, verdict, plan);
+      if (githubCtx) comment += '\n\n' + formatGitHubContextForComment(githubCtx);
+      // Append screenshot note if we have failure screenshots
+      if (failureScreenshots.length > 0) {
+        comment += `\n\n📸 *${failureScreenshots.length} failure screenshot(s) captured* — attach via QA Shield dashboard or browser extension.`;
+      }
+      await addComment(issue.id, comment);
+      commentPosted = true;
+
+      if (moveToDone && verdict === 'pass') {
+        await updateIssueState(issue.id, WORKFLOW_STATES.DONE);
+        movedToDone = true;
+      }
+    }
+
+    return {
+      identifier: issue.identifier,
+      title: issue.title,
+      verdict,
+      checks: allChecks,
+      summary: { passed, failed, warned, total },
+      movedToDone,
+      commentPosted,
+      failureScreenshots,
+    };
+
+  } catch (err: any) {
+    return {
+      identifier: issue.identifier,
+      title: issue.title,
+      verdict: 'fail',
+      checks: [],
+      summary: { passed: 0, failed: 0, warned: 0, total: 0 },
+      movedToDone: false,
+      commentPosted: false,
+      error: err.message,
+    };
+  }
+}
+
+// ============ Cross-Check Runner ============
+
+async function runCrossCheck(cc: CrossCheck): Promise<VerifyCheck> {
+  try {
+    const apiUrl = cc.apiEndpoint.startsWith('http') ? cc.apiEndpoint : `${STAGING_API_BASE}${cc.apiEndpoint}`;
+    const apiRes = await fetch(apiUrl, { signal: AbortSignal.timeout(10000) });
+    if (!apiRes.ok) {
+      return { name: cc.name, status: 'fail', details: `API ${cc.apiEndpoint} returned ${apiRes.status}` };
+    }
+    const apiData = await apiRes.json();
+    const apiValue = getNestedValue(apiData, cc.apiField);
+    if (apiValue === undefined || apiValue === null) {
+      return { name: cc.name, status: 'warn', details: `API field "${cc.apiField}" not found` };
+    }
+
+    const domRes = await fetch(`${BROWSER_WORKER}/dom`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        path: cc.domPath,
+        checks: [{ name: `Extract: ${cc.domSelector}`, selector: cc.domSelector, action: cc.domAction || 'text' }],
+      }),
+      signal: AbortSignal.timeout(45000),
+    });
+
+    const domData = await domRes.json();
+    const domResult = domData.results?.[0];
+
+    if (!domResult || domResult.status === 'fail') {
+      return { name: cc.name, status: 'fail', details: `UI element not found — selector: "${cc.domSelector}"` };
+    }
+
+    const domRaw = domResult.details || '';
+    const domNumMatch = domRaw.replace(/,/g, '').match(/-?\d+\.?\d*/);
+    const domValue = domNumMatch ? parseFloat(domNumMatch[0]) : null;
+    const apiNumeric = typeof apiValue === 'number' ? apiValue : parseFloat(String(apiValue).replace(/,/g, ''));
+    const tolerance = cc.tolerance ?? 0.01;
+
+    if (domValue === null) {
+      return { name: cc.name, status: 'warn', details: `Could not extract numeric from DOM: "${domRaw.substring(0, 100)}"` };
+    }
+
+    const diff = Math.abs(domValue - apiNumeric);
+    const pass = diff <= tolerance || (apiNumeric !== 0 && diff / Math.abs(apiNumeric) < 0.001);
+
+    return {
+      name: cc.name,
+      status: pass ? 'pass' : 'fail',
+      details: pass
+        ? `✅ API (${apiNumeric}) matches UI (${domValue})`
+        : `❌ MISMATCH — API: ${apiNumeric}, UI: ${domValue} (diff: ${diff.toFixed(4)})`,
+    };
+  } catch (err: any) {
+    return { name: cc.name, status: 'fail', details: `Cross-check error: ${err.message}` };
+  }
+}
+
+// ============ Verification Plan Builder ============
+
+const QA_SHIELD_BASE = `http://localhost:${process.env.PORT || 3000}`;
+
+// Poll AI queue for a result (up to maxWaitMs)
+async function waitForAIResult(taskId: string, maxWaitMs = 90_000): Promise<unknown | null> {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const res = await fetch(`${QA_SHIELD_BASE}/api/ai/queue?taskId=${taskId}`, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const task = await res.json();
+        if (task.status === 'done' && task.result) return task.result;
+        if (task.status === 'failed') return null;
+      }
+    } catch { /* retry */ }
+    await new Promise(r => setTimeout(r, 5000));
+  }
+  return null;
+}
+
+async function buildVerificationPlan(issue: LinearIssue, githubCtx?: GitHubContext): Promise<VerificationPlan> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+
+  // If no valid API key, try the OpenClaw AI queue (Chief QA processes it)
+  if (!apiKey || apiKey.startsWith('sk-ant-oat')) {
+    try {
+      const queueRes = await fetch(`${QA_SHIELD_BASE}/api/ai/queue`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'verify-plan',
+          payload: {
+            identifier: issue.identifier,
+            title: issue.title,
+            description: (issue.description || '').slice(0, 1000),
+            files: githubCtx?.allFilesChanged?.map(f => f.filename) || [],
+            impactedAreas: githubCtx?.impactedAreas || [],
+          },
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (queueRes.ok) {
+        const { taskId } = await queueRes.json();
+        console.log(`[verify-runner] Queued AI task ${taskId?.slice(0, 8)} for ${issue.identifier} — waiting for Chief QA...`);
+        const result = await waitForAIResult(taskId, 90_000);
+        if (result) {
+          const plan = result as VerificationPlan;
+          console.log(`[verify-runner] Got AI plan from Chief QA for ${issue.identifier}: ${plan.apiChecks?.length ?? 0} API, ${plan.domChecks?.length ?? 0} DOM checks`);
+          return plan;
+        }
+      }
+    } catch (queueErr: any) {
+      console.warn('[verify-runner] AI queue unavailable:', queueErr.message);
+    }
+    return buildFallbackPlan(issue);
+  }
+
+  if (!apiKey) return buildFallbackPlan(issue);
+
+  let githubSection = '';
+  if (githubCtx?.hasChanges) {
+    githubSection = `\nGITHUB CHANGES:\nFiles: ${githubCtx.allFilesChanged.map(f => f.filename).join(', ')}\nAreas: ${githubCtx.impactedAreas.join(', ')}\n`;
+    const filesWithPatches = githubCtx.allFilesChanged.filter(f => f.patch).slice(0, 2);
+    for (const file of filesWithPatches) {
+      githubSection += `\nDiff: ${file.filename}\n${file.patch!.substring(0, 600)}\n`;
+    }
+    githubSection += `\nFocus verification on what actually changed.\n`;
+  } else if (githubCtx) {
+    githubSection = `\nGITHUB: No commits on staging for this ticket yet.\n`;
+  }
+
+  // ── Build rich diff context for AI ──
+  let diffContext = '';
+  if (githubCtx?.hasChanges) {
+    // Include full patch for changed files (up to 3 files, 800 chars each)
+    const patches = githubCtx.allFilesChanged
+      .filter(f => f.patch)
+      .slice(0, 3)
+      .map(f => `File: ${f.filename}\nDiff:\n${f.patch!.substring(0, 800)}`)
+      .join('\n\n');
+    diffContext = patches
+      ? `\n\nCODE CHANGES (what actually changed in staging):\n${patches}\n\nUse the diff to understand EXACTLY what was fixed and write checks that directly verify that specific change.`
+      : '';
+  }
+
+  const systemPrompt = `You are QA Shield, a senior QA automation engineer for dev.creator.fun — a Solana meme coin creation and trading platform (similar to pump.fun).
+
+MISSION: Generate PRECISE, TARGETED verification checks that confirm THIS specific fix works on staging.
+
+CRITICAL RULES:
+1. Read the git diff carefully — understand WHAT changed (component, function, behavior)
+2. Map the change to the CORRECT page/URL where it's visible
+3. NEVER check /settings or unrelated pages
+4. If the fix is in TradingViewChart.tsx → check /details/[token-address]
+5. If the fix is in profile/ → check /profile
+6. If the fix is in Header.tsx → check / (homepage)
+7. If the fix is backend only (no UI change) → use apiChecks, no domChecks
+8. If nothing is directly testable, return empty arrays — do NOT invent checks
+
+Platform pages and what they contain:
+- / → token list, header, navigation, coin cards, discovery row
+- /details/[address] → TradingView chart, PnL chip, token sidebar, trading panel, holders table
+- /profile → wallet stats card (Holding/Invested/PnL), My Holdings table, transactions, created coins
+- /chat → chatrooms, user search, DMs
+- /leaderboard → rankings, stats
+- /create → coin creation form
+
+Working API endpoints (staging: https://dev.bep.creator.fun):
+- GET /api/token/list?limit=20 → {data:[{name,ticker,mcap,address,...}],total}
+- GET /api/token/:address → single token
+- GET /api/token/search?q=X → search results
+- GET /api/profile/stats/trading?userId=X → {remaining,invested,pnlValue,...}
+- GET /api/profile/my-holdings?userId=X → holdings list
+
+CSS color checks: use action:"style" with selector to verify computed styles.
+For visibility: use action:"visible" or action:"hidden".
+
+Respond ONLY with valid JSON (no markdown):
+{"reasoning":"1-2 sentences on what changed and what you're checking","apiChecks":[{"endpoint":"/api/path","checks":[{"field":"data.0.name","exists":true}]}],"domChecks":[{"path":"/correct-page","checks":[{"name":"Descriptive check name","selector":"CSS selector","action":"exists|text|visible|hidden|style"}]}],"crossChecks":[],"transactionCheck":null}`;
+
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(apiKey.startsWith('sk-ant-oat') ? { 'Authorization': `Bearer ${apiKey}` } : { 'x-api-key': apiKey }),
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2048,
+        temperature: 0,
+        system: systemPrompt,
+        messages: [{
+          role: 'user',
+          content: `TICKET: ${issue.identifier}: ${issue.title}\n\nDESCRIPTION:\n${(issue.description || 'No description').substring(0, 800)}\n\nLabels: ${issue.labels?.nodes?.map((l: any) => l.name).join(', ') || 'none'}\nDev comments: ${issue.comments?.nodes?.map((c: any) => `[${c.user?.name}]: ${c.body?.substring(0, 300)}`).join('\n') || 'None'}${githubSection}${diffContext}`,
+        }],
+      }),
+      signal: AbortSignal.timeout(25000),
+    });
+
+    const aiResp = await res.json();
+    if (aiResp.error) throw new Error(aiResp.error.message);
+
+    const raw = aiResp.content?.[0]?.text || '{}';
+    const jsonStr = raw.replace(/^```(?:json)?\s*/m, '').replace(/```\s*$/m, '').trim();
+    const parsed = JSON.parse(jsonStr);
+
+    return {
+      apiChecks: parsed.apiChecks || [],
+      domChecks: parsed.domChecks || [],
+      crossChecks: parsed.crossChecks || [],
+      transactionCheck: parsed.transactionCheck || undefined,
+      reasoning: parsed.reasoning || 'AI-generated verification plan',
+    };
+  } catch (err: any) {
+    console.error('[verify-runner] AI plan failed, fallback:', err.message);
+    return buildFallbackPlan(issue);
+  }
+}
+
+export function buildFallbackPlan(issue: LinearIssue): VerificationPlan {
+  const combined = `${issue.title} ${issue.description || ''}`.toLowerCase();
+  const plan: VerificationPlan = { apiChecks: [], domChecks: [], crossChecks: [], reasoning: '' };
+  const TOKEN_ADDR = 'Baea4r7r1XW4FUt2k8nToGM3pQtmmidzZP8BcKnQbRHG';
+  const API = 'https://dev.bep.creator.fun';
+
+  const matched: string[] = [];
+
+  // ── Chart / TradingView ──
+  if (/tradingview|chart|candle|overlay|pnl.?chip|zoom|resize|padding.*chart|chart.*padding/.test(combined)) {
+    plan.domChecks.push({
+      path: `/details/${TOKEN_ADDR}`,
+      checks: [
+        { name: 'TradingView chart renders', selector: 'canvas, .tradingview-widget-container, [class*="chart"]', action: 'exists' },
+        { name: 'Chart area visible', selector: '[class*="chart"], [id*="chart"]', action: 'visible' },
+        { name: 'No error overlay on chart', selector: '[class*="error-overlay"], [class*="chart-error"]', action: 'hidden' },
+      ],
+    });
+    matched.push('Chart/TradingView');
+  }
+
+  // ── Token detail sidebar / stats ──
+  if (/token.?detail|token.*stat|volume.*stat|stats.*card|mcap|market.?cap|token.*search|chart.*header|token.*title/.test(combined)) {
+    plan.domChecks.push({
+      path: `/details/${TOKEN_ADDR}`,
+      checks: [
+        { name: 'Token price visible', selector: '[class*="price"], [class*="token-price"]', action: 'exists' },
+        { name: 'Volume stat present', selector: '[class*="volume"], [class*="stat"]', action: 'exists' },
+        { name: 'Market cap present', selector: '[class*="mcap"], [class*="market-cap"], [class*="marketcap"]', action: 'exists' },
+      ],
+    });
+    plan.apiChecks.push({
+      endpoint: `${API}/api/token?address=${TOKEN_ADDR}`,
+      checks: [{ field: 'address', exists: true }, { field: 'price', exists: true }],
+    });
+    matched.push('Token Detail');
+  }
+
+  // ── Token search ──
+  if (/search.*dropdown|search.*token|token.*search/.test(combined)) {
+    plan.domChecks.push({
+      path: `/details/${TOKEN_ADDR}`,
+      checks: [
+        { name: 'Search input present', selector: 'input[type="search"], input[placeholder*="search" i], [class*="search-input"]', action: 'exists' },
+      ],
+    });
+    matched.push('Token Search');
+  }
+
+  // ── Discover / coin cards / discovery row ──
+  if (/coin.?card|discovery.?row|desktop.*discover|token.*list|discover/.test(combined)) {
+    plan.domChecks.push({
+      path: '/',
+      checks: [
+        { name: 'Token cards render', selector: '[class*="token-card"], [class*="coin-card"], [class*="TokenCard"]', action: 'exists' },
+        { name: 'Discovery row visible', selector: '[class*="discovery"], [class*="row"]', action: 'exists' },
+      ],
+    });
+    plan.apiChecks.push({
+      endpoint: `${API}/api/token/list?limit=10`,
+      checks: [{ field: 'data', type: 'array' }, { field: 'total', exists: true }],
+    });
+    matched.push('Discover/Token List');
+  }
+
+  // ── Navigation / header ──
+  if (/nav|navigation|menu|header|desktop.*nav/.test(combined)) {
+    plan.domChecks.push({
+      path: '/',
+      checks: [
+        { name: 'Navigation menu visible', selector: 'nav, header, [class*="navbar"], [class*="navigation"]', action: 'exists' },
+        { name: 'Nav links present', selector: 'nav a, [class*="nav-link"], [class*="menu-item"]', action: 'exists' },
+      ],
+    });
+    matched.push('Navigation');
+  }
+
+  // ── Trading / buy / sell / UI fixes ──
+  if (/trading.?page|trading.*ui|buy|sell|swap|trade/.test(combined)) {
+    plan.domChecks.push({
+      path: `/details/${TOKEN_ADDR}`,
+      checks: [
+        { name: 'Buy button present', selector: '[class*="buy"], button[data-action="buy"]', action: 'exists' },
+        { name: 'Trade panel visible', selector: '[class*="trade"], [class*="trading"], [class*="swap"]', action: 'exists' },
+      ],
+    });
+    matched.push('Trading UI');
+  }
+
+  // ── Profile / PnL / holdings / wallet ──
+  if (/profile|pnl|holding|portfolio|wallet|invested/.test(combined)) {
+    plan.domChecks.push({
+      path: '/profile',
+      checks: [
+        { name: 'Profile page renders', selector: 'main, [class*="profile"], body', action: 'exists' },
+        { name: 'PnL or stats section visible', selector: '[class*="pnl"], [class*="stat"], [class*="holding"]', action: 'exists' },
+      ],
+    });
+    matched.push('Profile/PnL');
+  }
+
+  // ── Mobile / scroll ──
+  if (/mobile|scroll|responsive/.test(combined)) {
+    plan.domChecks.push({
+      path: '/',
+      checks: [
+        { name: 'Page body renders on mobile viewport', selector: 'body', action: 'exists' },
+      ],
+    });
+    matched.push('Mobile/Scroll');
+  }
+
+  // ── Share / reward / visual ──
+  if (/share|reward|visual/.test(combined)) {
+    plan.domChecks.push({
+      path: `/details/${TOKEN_ADDR}`,
+      checks: [
+        { name: 'Share button or reward element visible', selector: '[class*="share"], [class*="reward"], button[aria-label*="share" i]', action: 'exists' },
+      ],
+    });
+    matched.push('Share/Reward');
+  }
+
+  // ── Chat / convo / spacing ──
+  if (/chat|convo|message|spacing.*convo|user.*search/.test(combined)) {
+    plan.domChecks.push({
+      path: `/details/${TOKEN_ADDR}`,
+      checks: [
+        { name: 'Chat panel present', selector: '[class*="chat"], [class*="messages"], [class*="convo"]', action: 'exists' },
+        { name: 'User search visible', selector: 'input[placeholder*="search" i], [class*="user-search"]', action: 'exists' },
+      ],
+    });
+    matched.push('Chat');
+  }
+
+  // ── Token data / icon / banner ──
+  if (/icon|banner|image|token.*data|base.?token/.test(combined)) {
+    plan.apiChecks.push({
+      endpoint: `${API}/api/token/list?limit=5`,
+      checks: [{ field: 'data', type: 'array' }, { field: 'data.0.image', exists: true }],
+    });
+    matched.push('Token Icon/Data');
+  }
+
+  // ── Security / CORS / JWT / auth / hardening ──
+  if (/cors|jwt|auth|harden|secret|rate.?limit|upload|onboard|security|penetration/.test(combined)) {
+    plan.apiChecks.push(
+      { endpoint: `${API}/api/token/list?limit=5`, checks: [{ field: 'data', type: 'array' }] },
+    );
+    matched.push('Security/Auth — manual review recommended for full validation');
+  }
+
+  // ── Leaderboard ──
+  if (/leaderboard|ranking/.test(combined)) {
+    plan.apiChecks.push({ endpoint: `${API}/api/leaderboard?limit=5`, checks: [{ field: 'data', exists: true }] });
+    plan.domChecks.push({
+      path: '/leaderboard',
+      checks: [{ name: 'Leaderboard renders', selector: 'table, [class*="leaderboard"], [class*="rank"]', action: 'exists' }],
+    });
+    matched.push('Leaderboard');
+  }
+
+  // ── SDK / Scale ──
+  if (/sdk|scale|scalecrx|graduated/.test(combined)) {
+    plan.apiChecks.push({ endpoint: `${API}/api/token/list?limit=5`, checks: [{ field: 'data', type: 'array' }] });
+    plan.domChecks.push({
+      path: '/',
+      checks: [{ name: 'App renders after SDK change', selector: 'body', action: 'exists' }],
+    });
+    matched.push('SDK/Scale');
+  }
+
+  if (matched.length === 0) {
+    // Generic smoke test — at minimum verify staging is alive
+    plan.apiChecks.push({ endpoint: `${API}/api/token/list?limit=5`, checks: [{ field: 'data', type: 'array' }] });
+    plan.domChecks.push({
+      path: '/',
+      checks: [{ name: 'Staging homepage loads', selector: 'body', action: 'exists' }],
+    });
+    plan.reasoning = `No specific area matched — running smoke test only. Manual verification required for: ${issue.title}`;
+  } else {
+    plan.reasoning = `Rule-based plan for: ${matched.join(', ')}`;
+  }
+
+  return plan;
+}
+
+// ============ Comment Formatter ============
+
+export function formatVerificationComment(
+  issue: { identifier: string; title: string },
+  checks: VerifyCheck[],
+  verdict: string,
+  plan: VerificationPlan
+): string {
+  const now = new Date().toISOString();
+  const passed = checks.filter(c => c.status === 'pass');
+  const failed = checks.filter(c => c.status === 'fail');
+  const warned = checks.filter(c => c.status === 'warn');
+
+  // Verdict block
+  const verdictIcon = verdict === 'pass' ? '✅' : verdict === 'fail' ? '❌' : '⚠️';
+  const verdictLabel = verdict === 'pass' ? 'PASSED' : verdict === 'fail' ? 'FAILED' : 'PARTIAL';
+  const verdictNote = verdict === 'pass'
+    ? 'All executed test cases passed. Ticket moved to Done.'
+    : verdict === 'fail'
+    ? 'One or more test cases failed. Ticket requires a fix before it can be closed.'
+    : 'Some checks passed, some failed — or test coverage was incomplete. Manual review recommended.';
+
+  let out = `## ${verdictIcon} QA Verification — ${verdictLabel}
+
+> **${issue.identifier}:** ${issue.title}
+> ${verdictNote}
+
+---
+
+### 🧪 Test Strategy
+${plan.reasoning}
+
+### 📊 Results Summary
+| Total | ✅ Passed | ❌ Failed | ⚠️ Warned |
+|-------|-----------|-----------|-----------|
+| ${checks.length} | ${passed.length} | ${failed.length} | ${warned.length} |
+
+`;
+
+  // Detailed test cases
+  if (checks.length > 0) {
+    out += `### 🔍 Test Cases Executed\n\n`;
+
+    checks.forEach((ch, i) => {
+      const icon = ch.status === 'pass' ? '✅' : ch.status === 'fail' ? '❌' : '⚠️';
+      // Parse name to detect type: API vs DOM
+      const isApi = ch.name.toLowerCase().includes('http') || ch.name.toLowerCase().includes('get ') || ch.name.toLowerCase().includes('post ') || ch.name.toLowerCase().includes('api');
+      const type = isApi ? '`API`' : '`UI`';
+
+      out += `**${i + 1}. ${icon} ${ch.name}** ${type}\n`;
+      out += `- **Result:** ${ch.status.toUpperCase()}\n`;
+      out += `- **Detail:** ${ch.details || '(no detail)'}\n\n`;
+    });
+  } else {
+    out += `### 🔍 Test Cases Executed\n\n`;
+    out += `> ⚠️ **No automated test cases were generated for this ticket.**\n>\n`;
+    out += `> This can happen when:\n`;
+    out += `> - The ticket scope is ambiguous or requires visual/manual verification\n`;
+    out += `> - AI verification planner is unavailable (no API key)\n`;
+    out += `> - The fix is in an area not yet covered by QA Shield's rule-based mapper\n>\n`;
+    out += `> **Action required:** A human QA engineer should verify this ticket manually.\n\n`;
+  }
+
+  // Limitations / caveats
+  const caveats: string[] = [];
+  if (verdict !== 'fail' && plan.reasoning.toLowerCase().includes('security')) {
+    caveats.push('Security hardening tickets require additional manual testing — automated checks only verify basic endpoint availability, not auth enforcement.');
+  }
+  if (verdict !== 'fail' && plan.reasoning.toLowerCase().includes('tradingview')) {
+    caveats.push('TradingView chart internals render in an iframe — visual properties (colors, overlays) cannot be fully verified via DOM automation.');
+  }
+  if (verdict !== 'fail' && plan.reasoning.toLowerCase().includes('manual')) {
+    caveats.push('Rule-based plan was used (no AI available) — checks may not fully cover the ticket scope.');
+  }
+  if (checks.length > 0 && checks.length < 3) {
+    caveats.push(`Only ${checks.length} check(s) were run — coverage may be incomplete. More checks will be available once AI verification planner is enabled.`);
+  }
+
+  if (caveats.length > 0) {
+    out += `### ⚠️ Caveats & Limitations\n`;
+    caveats.forEach(c => { out += `- ${c}\n`; });
+    out += '\n';
+  }
+
+  out += `---\n*QA Shield 🛡️ automated verification — ${now}*`;
+  return out;
+}
+
+// ============ Helpers ============
+
+function getNestedValue(obj: any, path: string): any {
+  return path.split('.').reduce((curr: any, key: string) => {
+    if (curr == null) return undefined;
+    const arrMatch = key.match(/^(\w+)\[(\d+)\]$/);
+    if (arrMatch) return curr[arrMatch[1]]?.[parseInt(arrMatch[2])];
+    return curr[key];
+  }, obj);
+}
