@@ -44,7 +44,8 @@ export async function POST(req: NextRequest) {
             ? `${githubCtx.commits.length} commit(s) found in [${githubCtx.repos.map(r => r.split('/')[1]).join(', ')}]`
             : 'No commits on staging yet';
           send('step', { step: 0, status: 'done', label: ghLabel });
-          send('github', { context: githubCtx });
+          // Send trimmed summary only — full context is large and causes stream flush issues
+          send('github', { context: { hasChanges: githubCtx?.hasChanges, commitCount: githubCtx?.commits?.length ?? 0, repos: githubCtx?.repos ?? [] } });
         } catch (ghErr) {
           githubCtx = null;
           send('step', { step: 0, status: 'done', label: 'GitHub context unavailable (skipped)' });
@@ -75,6 +76,8 @@ export async function POST(req: NextRequest) {
           send('step', { step: 2, status: 'done', label: postComment ? 'Comment will be posted by Codex when ready' : 'Skipped (postComment=false)' });
           send('step', { step: 3, status: 'done', label: 'Returned immediately — Codex running in background' });
           send('done', { success: true, identifier, queued: true, message: 'Codex is analyzing in background. Linear comment will appear in ~2-3 minutes.' });
+          // Give stream time to flush before closing
+          await new Promise(r => setTimeout(r, 200));
           controller.close();
           return;
         }
