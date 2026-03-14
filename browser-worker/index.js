@@ -2,200 +2,89 @@
 /**
  * QA Shield Browser Worker — standalone Playwright process
  * HTTP server on port 3099
- * v0.4: warm authenticated context + persistent auth state
+ * v0.5: connects to real Chrome via CDP (OpenClaw relay on port 18800)
+ *       Falls back to headless Playwright Chromium if CDP unavailable
  */
 
 const { chromium } = require('playwright');
 const http = require('http');
 const fs = require('fs');
-const path = require('path');
 
-const PORT = process.env.BROWSER_WORKER_PORT || 3099;
+const PORT = parseInt(process.env.BROWSER_WORKER_PORT || '3099', 10);
 const STAGING_URL = process.env.STAGING_URL || 'https://dev.creator.fun';
-const PASSWORD_GATE = 'georgecfun';
-const AUTH_STATE_FILE = path.join(__dirname, 'auth-state.json');
-// How old auth state can be before we consider it stale (6 hours)
-const AUTH_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const PASSWORD_GATE = process.env.PASSWORD_GATE || 'georgecfun';
+
+// Chrome CDP endpoint — OpenClaw browser relay
+const CHROME_CDP_URL = process.env.CHROME_CDP_URL || 'http://127.0.0.1:18800';
 
 let browser = null;
-let warmContext = null;
-let warmPage = null;
+let usingCDP = false;
 
 // ── Browser singleton ──
 
 async function getBrowser() {
-  if (browser && browser.isConnected()) return browser;
+  // Test if existing connection still alive
+  if (browser) {
+    try {
+      browser.contexts(); // throws if disconnected
+      return browser;
+    } catch {
+      browser = null;
+    }
+  }
+
+  // Try CDP first (real Chrome with extensions)
+  try {
+    console.log(`[BrowserWorker] Connecting to real Chrome via CDP: ${CHROME_CDP_URL}`);
+    browser = await chromium.connectOverCDP(CHROME_CDP_URL);
+    usingCDP = true;
+    console.log('[BrowserWorker] ✅ Connected to real Chrome (extensions + session available)');
+    return browser;
+  } catch (cdpErr) {
+    console.warn(`[BrowserWorker] CDP unavailable (${cdpErr.message}) — falling back to headless Chromium`);
+  }
+
+  // Fallback: headless Playwright Chromium
   browser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
   });
+  usingCDP = false;
+  console.log('[BrowserWorker] ✅ Headless Chromium launched (no extensions)');
   return browser;
 }
 
-// ── Auth state helpers ──
+// ── Page factory ──
+// When using CDP: opens a new tab in real Chrome (inherits session/cookies)
+// When using headless: creates a new context + page
 
-function loadAuthState() {
-  try {
-    if (!fs.existsSync(AUTH_STATE_FILE)) return null;
-    const raw = JSON.parse(fs.readFileSync(AUTH_STATE_FILE, 'utf8'));
-    const age = Date.now() - (raw.savedAt || 0);
-    if (age > AUTH_MAX_AGE_MS) {
-      console.log('[BrowserWorker] Auth state expired, will re-auth');
-      return null;
-    }
-    console.log(`[BrowserWorker] Loaded auth state (${Math.round(age / 60000)}m old)`);
-    return raw.state;
-  } catch {
-    return null;
-  }
-}
-
-function saveAuthState(state) {
-  try {
-    fs.writeFileSync(AUTH_STATE_FILE, JSON.stringify({ savedAt: Date.now(), state }, null, 2));
-    console.log('[BrowserWorker] Auth state saved ✅');
-  } catch (e) {
-    console.error('[BrowserWorker] Could not save auth state:', e.message);
-  }
-}
-
-// ── Warm page — persistent authenticated context ──
-
-async function getWarmPage() {
-  if (warmPage && !warmPage.isClosed()) return warmPage;
-
-  console.log('[BrowserWorker] Warming up authenticated page...');
+async function newPage() {
   const b = await getBrowser();
 
-  if (warmContext) {
-    await warmContext.close().catch(() => {});
-    warmContext = null;
-    warmPage = null;
-  }
-
-  // Load saved auth state if available
-  const savedState = loadAuthState();
-  warmContext = await b.newContext({
-    viewport: { width: 1400, height: 900 },
-    ...(savedState ? { storageState: savedState } : {}),
-  });
-  warmPage = await warmContext.newPage();
-
-  // Navigate to site
-  await warmPage.goto(STAGING_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
-
-  // Handle password gate
-  try {
-    const pwInput = await warmPage.waitForSelector('input[type="password"]', { timeout: 3000 });
-    if (pwInput) {
-      await pwInput.fill(PASSWORD_GATE);
-      await warmPage.keyboard.press('Enter');
-      await warmPage.waitForTimeout(2000);
-    }
-  } catch (_) {}
-
-  // Check if we're actually logged in
-  const isLoggedIn = await checkIsLoggedIn(warmPage);
-  console.log(`[BrowserWorker] Auth status: ${isLoggedIn ? '✅ Logged in' : '❌ Not logged in'}`);
-
-  if (!isLoggedIn && !savedState) {
-    console.log('[BrowserWorker] ⚠️  Not authenticated. Call POST /login to authenticate.');
-  }
-
-  // If we have a session, save updated state
-  if (isLoggedIn) {
-    const currentState = await warmContext.storageState();
-    saveAuthState(currentState);
-  }
-
-  console.log('[BrowserWorker] Warm page ready ✅');
-  return warmPage;
-}
-
-async function checkIsLoggedIn(page) {
-  try {
-    // Check for auth indicators: no login button, has wallet address or username
-    const result = await page.evaluate(() => {
-      const body = document.body?.innerText || '';
-      const hasLogin = /^login$/im.test(body.split('\n').map(l => l.trim()).join('\n'));
-      const hasWallet = body.includes('wallet') || document.querySelector('[class*=wallet],[class*=Wallet],[class*=address]');
-      const hasUsername = document.querySelector('[class*=username],[class*=UserName],[class*=user-name]');
-      const hasBalance = document.querySelector('[class*=balance],[class*=Balance]');
-      return { hasLogin, hasWallet: !!hasWallet, hasUsername: !!hasUsername, hasBalance: !!hasBalance };
-    });
-    return result.hasWallet || result.hasUsername || result.hasBalance;
-  } catch {
-    return false;
-  }
-}
-
-// ── Reset warm context ──
-async function resetWarmPage() {
-  if (warmPage) await warmPage.close().catch(() => {});
-  if (warmContext) await warmContext.close().catch(() => {});
-  warmPage = null;
-  warmContext = null;
-  return getWarmPage();
-}
-
-// ── Manual login flow (opens visible browser, waits for user to login) ──
-async function performLogin() {
-  console.log('[BrowserWorker] Opening visible browser for manual login...');
-
-  // Launch visible browser for login
-  const loginBrowser = await chromium.launch({
-    headless: false,
-    args: ['--no-sandbox'],
-  });
-
-  const ctx = await loginBrowser.newContext({ viewport: { width: 1400, height: 900 } });
-  const page = await ctx.newPage();
-
-  await page.goto(STAGING_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
-
-  // Handle password gate
-  try {
-    const pwInput = await page.waitForSelector('input[type="password"]', { timeout: 3000 });
-    if (pwInput) {
-      await pwInput.fill(PASSWORD_GATE);
-      await page.keyboard.press('Enter');
-      await page.waitForTimeout(2000);
-    }
-  } catch (_) {}
-
-  console.log('[BrowserWorker] 👆 Please log in to dev.creator.fun in the browser window...');
-  console.log('[BrowserWorker] Waiting for login (up to 3 minutes)...');
-
-  // Wait for login to complete — watch for auth indicators
-  let loggedIn = false;
-  const deadline = Date.now() + 3 * 60 * 1000;
-
-  while (Date.now() < deadline) {
-    await page.waitForTimeout(2000);
-    loggedIn = await checkIsLoggedIn(page);
-    if (loggedIn) break;
-  }
-
-  if (loggedIn) {
-    const state = await ctx.storageState();
-    saveAuthState(state);
-    console.log('[BrowserWorker] ✅ Login successful! Auth state saved.');
-
-    // Reset warm page so it picks up new auth
-    await loginBrowser.close();
-    await resetWarmPage();
-    return { success: true, message: 'Login successful, auth state saved' };
+  if (usingCDP) {
+    // Use first existing context (shares Chrome session) or create one
+    const contexts = b.contexts();
+    const ctx = contexts.length > 0 ? contexts[0] : await b.newContext();
+    const page = await ctx.newPage();
+    return { page, ctx: null }; // ctx managed by Chrome
   } else {
-    await loginBrowser.close();
-    return { success: false, message: 'Login timeout — user did not authenticate within 3 minutes' };
-  }
-}
+    // Headless fallback — create fresh context
+    const ctx = await b.newContext({ viewport: { width: 1400, height: 900 } });
+    const page = await ctx.newPage();
 
-// ── Inject auth state manually (from external cookie export) ──
-async function injectAuthState(state) {
-  saveAuthState(state);
-  await resetWarmPage();
-  return { success: true, message: 'Auth state injected and warm page reset' };
+    // Handle password gate
+    await page.goto(STAGING_URL, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+    try {
+      const pwInput = await page.waitForSelector('input[type="password"]', { timeout: 3000 });
+      if (pwInput) {
+        await pwInput.fill(PASSWORD_GATE);
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(2000);
+      }
+    } catch (_) {}
+
+    return { page, ctx };
+  }
 }
 
 // ── DOM check runner ──
@@ -203,44 +92,43 @@ async function injectAuthState(state) {
 async function runDOMChecks(path, checks) {
   const results = [];
   let screenshot = null;
+  let ctx = null;
+  let page = null;
 
   try {
-    const page = await getWarmPage();
-    const url = path.startsWith('http') ? path : `${STAGING_URL}${path}`;
+    ({ page, ctx } = await newPage());
 
+    const url = path.startsWith('http') ? path : `${STAGING_URL}${path}`;
+    console.log(`[BrowserWorker] Navigating to: ${url}`);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(1500);
-
-    // Detect session expiry — if bounced to login, re-auth
-    const currentUrl = page.url();
-    if (currentUrl.includes('/login') || currentUrl.includes('/auth')) {
-      console.log('[BrowserWorker] Session expired, resetting...');
-      fs.existsSync(AUTH_STATE_FILE) && fs.unlinkSync(AUTH_STATE_FILE);
-      await resetWarmPage();
-      const freshPage = await getWarmPage();
-      await freshPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await freshPage.waitForTimeout(1500);
-    }
 
     for (const check of checks) {
       try {
         const r = await executeCheck(page, check);
         results.push(r);
       } catch (e) {
-        results.push({ name: check.name || check.selector, status: 'fail', details: e.message });
+        results.push({ name: check.name || check.selector || check.action, status: 'fail', details: e.message });
       }
     }
 
-    const buf = await page.screenshot({ type: 'jpeg', quality: 50 });
+    const buf = await page.screenshot({ type: 'jpeg', quality: 60 });
     screenshot = buf.toString('base64');
 
   } catch (e) {
+    console.error(`[BrowserWorker] DOM check error: ${e.message}`);
     results.push({ name: `Navigate to ${path}`, status: 'fail', details: e.message });
-    warmPage = null;
+    browser = null; // Force reconnect next time
+  } finally {
+    // Close page (and ctx if headless) but leave Chrome browser running
+    if (page) await page.close().catch(() => {});
+    if (ctx) await ctx.close().catch(() => {});
   }
 
   return { results, screenshot };
 }
+
+// ── Check executor ──
 
 async function executeCheck(page, check) {
   const name = check.name || `${check.action || 'exists'}: ${check.selector}`;
@@ -255,6 +143,12 @@ async function executeCheck(page, check) {
       if (!el) return { name, status: 'fail', details: 'Element not found' };
       const vis = await el.isVisible();
       return { name, status: vis ? 'pass' : 'fail', details: vis ? 'Visible' : 'NOT visible' };
+    }
+    case 'hidden': {
+      const el = await page.$(check.selector);
+      if (!el) return { name, status: 'pass', details: 'Element absent (hidden)' };
+      const vis = await el.isVisible();
+      return { name, status: !vis ? 'pass' : 'fail', details: !vis ? 'Hidden ✅' : 'Still visible ❌' };
     }
     case 'text': {
       const el = await page.$(check.selector);
@@ -292,96 +186,112 @@ async function executeCheck(page, check) {
       const result = await page.evaluate(check.evaluate);
       return { name, status: result ? 'pass' : 'fail', details: JSON.stringify(result).substring(0, 200) };
     }
+    case 'screenshot': {
+      const buf = await page.screenshot({ type: 'jpeg', quality: 70 });
+      return { name, status: 'pass', details: 'Screenshot captured', screenshot: buf.toString('base64') };
+    }
     default:
-      return { name, status: 'skip', details: `Unknown: ${check.action}` };
+      return { name, status: 'skip', details: `Unknown action: ${check.action}` };
+  }
+}
+
+// ── Screenshot endpoint ──
+
+async function takeScreenshot(path) {
+  const url = path.startsWith('http') ? path : `${STAGING_URL}${path}`;
+  const { page, ctx } = await newPage();
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(1000);
+    const buf = await page.screenshot({ type: 'jpeg', quality: 75, fullPage: false });
+    return buf.toString('base64');
+  } finally {
+    await page.close().catch(() => {});
+    if (ctx) await ctx.close().catch(() => {});
   }
 }
 
 // ── HTTP Server ──
 
 const server = http.createServer(async (req, res) => {
+  const send = (status, body) => {
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+  };
 
-  if (req.method === 'POST' && req.url === '/dom') {
-    let body = '';
-    req.on('data', d => { body += d; });
-    req.on('end', async () => {
-      try {
-        const { path, checks } = JSON.parse(body);
-        const result = await runDOMChecks(path, checks);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(result));
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message, results: [] }));
-      }
-    });
-
-  } else if (req.method === 'POST' && req.url === '/login') {
-    // Opens a visible browser window for manual login, saves auth state
-    try {
-      const result = await performLogin();
-      res.writeHead(result.success ? 200 : 408, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(result));
-    } catch (e) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: false, error: e.message }));
-    }
-
-  } else if (req.method === 'POST' && req.url === '/inject-auth') {
-    // Accept pre-exported auth state (cookies + localStorage) and inject it
-    let body = '';
-    req.on('data', d => { body += d; });
-    req.on('end', async () => {
-      try {
-        const { state } = JSON.parse(body);
-        const result = await injectAuthState(state);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(result));
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-
-  } else if (req.method === 'POST' && req.url === '/reset') {
-    try {
-      await resetWarmPage();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, message: 'Warm page reset' }));
-    } catch (e) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-
-  } else if (req.method === 'GET' && req.url === '/health') {
-    const authStateExists = fs.existsSync(AUTH_STATE_FILE);
-    const authAge = authStateExists
-      ? Math.round((Date.now() - JSON.parse(fs.readFileSync(AUTH_STATE_FILE, 'utf8')).savedAt) / 60000)
-      : null;
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
+  if (req.method === 'GET' && req.url === '/health') {
+    let browserOk = false;
+    try { if (browser) { browser.contexts(); browserOk = true; } } catch {}
+    return send(200, {
       ok: true,
-      browserReady: !!(browser && browser.isConnected()),
-      warmPageReady: !!(warmPage && !warmPage.isClosed()),
-      authStateSaved: authStateExists,
-      authAgeMinutes: authAge,
-    }));
+      mode: usingCDP ? 'chrome-cdp' : 'headless',
+      cdpUrl: CHROME_CDP_URL,
+      browserConnected: browserOk,
+      stagingUrl: STAGING_URL,
+      port: PORT,
+    });
+  }
 
-  } else {
-    res.writeHead(404);
-    res.end();
+  if (req.method === 'POST') {
+    let body = '';
+    req.on('data', d => { body += d; });
+    req.on('end', async () => {
+      try {
+        const data = JSON.parse(body);
+
+        if (req.url === '/dom') {
+          const { path, checks } = data;
+          if (!path || !checks) return send(400, { error: 'path and checks required' });
+          const result = await runDOMChecks(path, checks);
+          return send(200, result);
+        }
+
+        if (req.url === '/screenshot') {
+          const { path } = data;
+          if (!path) return send(400, { error: 'path required' });
+          const screenshot = await takeScreenshot(path);
+          return send(200, { screenshot });
+        }
+
+        if (req.url === '/reset') {
+          browser = null;
+          await getBrowser(); // reconnect
+          return send(200, { ok: true, message: 'Browser reconnected' });
+        }
+
+        return send(404, { error: 'Unknown endpoint' });
+      } catch (e) {
+        console.error(`[BrowserWorker] Request error: ${e.message}`);
+        return send(500, { error: e.message, results: [] });
+      }
+    });
+    return;
+  }
+
+  send(404, { error: 'Not found' });
+});
+
+// ── Startup ──
+
+server.listen(PORT, '127.0.0.1', async () => {
+  console.log(`[BrowserWorker] v0.5 ready on http://127.0.0.1:${PORT}`);
+  console.log(`[BrowserWorker] CDP target: ${CHROME_CDP_URL}`);
+  console.log(`[BrowserWorker] Staging URL: ${STAGING_URL}`);
+  // Pre-connect on startup
+  try {
+    await getBrowser();
+  } catch (e) {
+    console.warn(`[BrowserWorker] Pre-connect failed: ${e.message}`);
   }
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`[BrowserWorker] Ready on http://127.0.0.1:${PORT}`);
-  console.log(`[BrowserWorker] Auth state file: ${AUTH_STATE_FILE}`);
-  // Pre-warm on startup
-  getWarmPage().catch(e => console.error('[BrowserWorker] Pre-warm failed:', e.message));
+process.on('SIGTERM', async () => {
+  if (browser && !usingCDP) await browser.close().catch(() => {});
+  process.exit(0);
 });
 
-process.on('SIGTERM', async () => {
-  if (warmContext) await warmContext.close().catch(() => {});
-  if (browser) await browser.close().catch(() => {});
-  process.exit(0);
+process.on('uncaughtException', (err) => {
+  console.error('[BrowserWorker] Uncaught:', err.message);
+  // Don't crash — reset browser and continue
+  browser = null;
 });
