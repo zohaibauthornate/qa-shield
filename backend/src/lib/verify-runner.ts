@@ -12,6 +12,8 @@ import {
 import { verifyAPI, verifyDOM, verifyQuickBuy, type VerifyCheck } from '@/lib/verifier';
 import { getTicketContext, formatGitHubContextForComment, type GitHubContext } from '@/lib/github';
 import { verifyCodeChanges, inferRepo, type CodeCheck } from '@/lib/code-verifier';
+import { scanEndpoint, apiLevelBenchmark } from '@/lib/scanner';
+import { fileCommitFindings, type CommitFinding } from '@/lib/guardian';
 
 const STAGING_API_BASE = process.env.STAGING_API_URL || 'https://dev.bep.creator.fun';
 const BROWSER_WORKER = process.env.BROWSER_WORKER_URL || 'http://127.0.0.1:3099';
@@ -168,13 +170,64 @@ export async function runVerification(
     let commentPosted = false;
     let movedToDone = false;
 
+    // ── Side scan: security + performance (always runs alongside verify) ──
+    const SCAN_ENDPOINTS = [
+      '/api/token/list?limit=5',
+      '/api/token?address=3jHkaVj9392sasDhVWivWyW8UYY3cfRCRJg3eEprDH7Q',
+    ];
+    let sideScanComment = '';
+    let criticalFindings: CommitFinding[] = [];
+    try {
+      const [secResults, perfResults] = await Promise.all([
+        Promise.all(SCAN_ENDPOINTS.map(ep => scanEndpoint(`${STAGING_API_BASE}${ep}`))),
+        apiLevelBenchmark(2),
+      ]);
+      const PERF_THRESHOLD_MS = 400;
+      const COMPETITORS = [{ name: 'pump.fun', avgMs: 280 }, { name: 'axiom.trade', avgMs: 180 }];
+
+      const findings: CommitFinding[] = [];
+      for (const sec of secResults) {
+        for (const chk of sec.checks.filter((c: any) => c.status === 'fail')) {
+          findings.push({ type: 'security', endpoint: sec.endpoint, title: `[Security] ${chk.type.toUpperCase()} — ${sec.endpoint.replace(STAGING_API_BASE, '')}`, description: chk.details, severity: chk.severity === 'critical' || chk.severity === 'high' ? 'high' : 'medium' });
+        }
+      }
+      for (const perf of perfResults) {
+        if (perf.ourAvg > PERF_THRESHOLD_MS) {
+          const fastest = COMPETITORS.sort((a, b) => a.avgMs - b.avgMs)[0];
+          const deltaPct = Math.round(((perf.ourAvg - fastest.avgMs) / fastest.avgMs) * 100);
+          findings.push({ type: 'performance', endpoint: perf.ourEndpoint, title: `[Performance] ${perf.ourEndpoint} — ${perf.ourAvg}ms avg (${deltaPct}% slower than ${fastest.name})`, description: `Avg: ${perf.ourAvg}ms, P95: ${perf.ourP95}ms`, severity: perf.ourAvg >= 1000 ? 'critical' : perf.ourAvg >= 600 ? 'high' : 'medium' });
+        }
+      }
+
+      criticalFindings = findings.filter(f => ['critical', 'high'].includes(f.severity));
+      if (findings.length > 0) {
+        await fileCommitFindings(findings, 'manual-verify', issue.identifier).catch(() => {});
+      }
+
+      const secFindings = findings.filter(f => f.type === 'security');
+      const perfFindings = findings.filter(f => f.type === 'performance');
+      const secLines = secFindings.length === 0 ? '✅ No security issues detected' : secFindings.map(f => `${f.severity === 'critical' || f.severity === 'high' ? '❌' : '⚠️'} **[${(f.severity||'').toUpperCase()}]** ${f.title}`).join('\n');
+      const perfLines = perfFindings.length === 0 ? '✅ No performance regressions detected' : perfFindings.map(f => `${f.severity === 'critical' || f.severity === 'high' ? '❌' : '⚠️'} **[${(f.severity||'').toUpperCase()}]** ${f.title}`).join('\n');
+
+      sideScanComment = [
+        `\n\n## 🔍 Security & Performance Scan`,
+        `> Automated scan run alongside this verification`,
+        `\n### 🔒 Security\n${secLines}`,
+        `\n### ⚡ Performance\n${perfLines}`,
+        `\n*Scanned: ${new Date().toISOString()}*`,
+      ].join('\n');
+    } catch (scanErr: any) {
+      console.warn(`[verify-runner] Side scan failed: ${scanErr.message}`);
+    }
+
     if (postComment) {
       let comment = formatVerificationComment(issue, allChecks, verdict, plan, codeVerifyNote);
       if (githubCtx) comment += '\n\n' + formatGitHubContextForComment(githubCtx);
-      // Append screenshot note if we have failure screenshots
       if (failureScreenshots.length > 0) {
-        comment += `\n\n📸 *${failureScreenshots.length} failure screenshot(s) captured* — attach via QA Shield dashboard or browser extension.`;
+        comment += `\n\n📸 *${failureScreenshots.length} failure screenshot(s) captured*`;
       }
+      // Append side scan results directly to the verification comment
+      if (sideScanComment) comment += sideScanComment;
       await addComment(issue.id, comment);
       commentPosted = true;
 
