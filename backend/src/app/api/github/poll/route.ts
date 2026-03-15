@@ -406,26 +406,12 @@ async function processCommit(
       console.log(`[poll] Side-scan: filed=${filed.length}, skipped=${skipped}`);
     }
 
-    // ── Step 8: Slack alert to QA channel ──
+    // ── Step 8: Slack alert — ONLY for critical/high security+perf findings ──
+    // Per-ticket verify results go to Linear comments only, not Slack.
     const QA_CHANNEL = process.env.REGRESSION_SLACK_CHANNEL || 'C0AKXN13UB0';
-    const verdictEmoji = verifyResult.verdict === 'pass' ? '✅' : verifyResult.verdict === 'fail' ? '❌' : '⚠️';
-    const verdictLabel = verifyResult.verdict.toUpperCase();
-    const codeChecks = verifyResult.checks.filter(c => c.name.startsWith('[Code]'));
-    const liveChecks = verifyResult.checks.filter(c => !c.name.startsWith('[Code]'));
-    const findingsStr = filedFindings.length > 0 ? `\n🎫 *${filedFindings.length} finding(s) filed:* ${filedFindings.join(', ')}` : '';
-    const createdStr = ticketCreated ? `\n🆕 Ticket auto-created (no existing ticket found)` : '';
-
-    const mainMsg = [
-      `${verdictEmoji} *${ticketId}* — *${verdictLabel}* | Commit <${commitUrl}|\`${short}\`> on \`${repoName}/${BRANCH}\``,
-      `🔍 Code: ${codeChecks.filter(c => c.status==='pass').length}✓ ${codeChecks.filter(c => c.status==='fail').length}✗ / ${codeChecks.length}  |  🧪 Live: ${liveChecks.filter(c => c.status==='pass').length}✓ ${liveChecks.filter(c => c.status==='fail').length}✗ / ${liveChecks.length}`,
-      `🔗 <${linearUrl}|View in Linear>${findingsStr}${createdStr}`,
-    ].join('\n');
-    await slackAlertToChannel(mainMsg, QA_CHANNEL);
-
-    // Extra alert for critical/high findings
     if (criticalFindings.length > 0) {
       const critMsg = [
-        `🚨 *Critical/High findings on \`${repoName}\` commit \`${short}\`*`,
+        `🚨 *Critical/High finding(s) — \`${repoName}\` commit \`${short}\`*`,
         criticalFindings.map(f => `• *[${f.severity.toUpperCase()}]* ${f.title}`).join('\n'),
         `🔗 <${linearUrl}|${ticketId}> | <${commitUrl}|Commit>`,
       ].join('\n');
