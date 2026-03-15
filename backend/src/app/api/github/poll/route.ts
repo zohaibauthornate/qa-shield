@@ -20,6 +20,7 @@ import { spawnCodexEnrich, getJobByIdentifier } from '@/lib/codex-background';
 import { runVerification } from '@/lib/verify-runner';
 import {
   getIssueByIdentifier,
+  createIssue,
   addComment,
   addLabel,
   updateIssueState,
@@ -180,6 +181,17 @@ async function slackAlert(msg: string) {
   }).catch(() => {});
 }
 
+// Post to a specific Slack channel via Bot token (used for QA alerts)
+async function slackAlertToChannel(msg: string, channel: string) {
+  const token = process.env.SLACK_BOT_TOKEN;
+  if (!token) { await slackAlert(msg); return; } // fallback to webhook
+  await fetch('https://slack.com/api/chat.postMessage', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+    body: JSON.stringify({ channel, text: msg }),
+  }).catch(() => {});
+}
+
 function buildSlackMsg(
   ticketId: string,
   verdict: string,
@@ -285,43 +297,66 @@ async function processCommit(
   const commitUrl = `https://github.com/${repo}/commit/${commitSha}`;
 
   try {
-    // ── Step 1: Check if ticket exists in Linear ──
-    const issue = await getIssueByIdentifier(ticketId);
+    // ── Step 1: Find or create Linear ticket ──
+    let issue: any;
+    let ticketCreated = false;
+    try {
+      issue = await getIssueByIdentifier(ticketId);
+    } catch {
+      issue = null;
+    }
 
     if (!issue) {
-      // No ticket found — log and skip. Security+perf scanning is tied to ticket verification.
-      console.log(`[poll] ${ticketId} NOT found in Linear — skipping (no ticket to verify against)`);
-      return { ticketId, verdict: 'no-ticket' };
+      // Auto-create ticket from commit info
+      console.log(`[poll] ${ticketId} not found — creating ticket from commit`);
+      const changedFiles = filesChanged.map(f => f.filename).join(', ');
+      const areas = [...new Set(filesChanged.map(f => f.filename.split('/')[0]))].join(', ');
+      try {
+        issue = await createIssue({
+          title: `${commitMessage.slice(0, 100)}`,
+          description: [
+            `Auto-created by QA Shield on commit push.\n`,
+            `**Commit:** [\`${short}\`](${commitUrl})`,
+            `**Branch:** \`${repo}/${BRANCH}\``,
+            `**Author:** ${author}`,
+            `**Files changed (${filesChanged.length}):** ${changedFiles}`,
+            `**Areas:** ${areas}`,
+          ].join('\n'),
+          stateId: WORKFLOW_STATES.IN_REVIEW,
+        });
+        ticketCreated = true;
+        console.log(`[poll] Auto-created ticket for ${ticketId}: ${issue.id}`);
+      } catch (createErr: any) {
+        console.warn(`[poll] Could not create ticket for ${ticketId}: ${createErr.message}`);
+        return { ticketId, verdict: 'no-ticket' };
+      }
     }
 
     // ── Step 2: Skip Done tickets entirely ──
     const currentState = (issue as any).state?.name || '';
     if (currentState === 'Done') {
-      console.log(`[poll] ${ticketId} is already Done — skipping analysis + verification`);
+      console.log(`[poll] ${ticketId} is already Done — skipping`);
       return { ticketId, verdict: 'already-done' };
     }
 
-    // ── Step 3: Ticket found — trigger Codex enrichment (once per commit SHA) ──
-    // Guard: check in-memory job AND whether a Codex comment already exists on the ticket
+    // ── Step 3: Codex enrichment (once — check existing comment to survive restarts) ──
     try {
       const existingJob = getJobByIdentifier(ticketId);
-      const alreadyEnriched = existingJob && ['done','running','queued'].includes(existingJob.status);
-      if (!alreadyEnriched) {
-        // Also check if a Codex analysis comment already exists (survives restarts)
+      const alreadyRunning = existingJob && ['done','running','queued'].includes(existingJob.status);
+      if (!alreadyRunning) {
         const comments = (issue as any).comments?.nodes || [];
         const hasCodexComment = comments.some((c: any) =>
-          c.body?.includes('QA Shield — Ticket Analysis (Codex)') ||
-          c.body?.includes('Ticket Analysis (Codex)')
+          c.body?.includes('Ticket Analysis (Codex)') || c.body?.includes('QA Shield — Ticket Analysis')
         );
         if (!hasCodexComment) {
           spawnCodexEnrich(ticketId, JSON.stringify(issue), JSON.stringify(null), true);
           console.log(`[poll] Codex enrichment queued for ${ticketId}`);
         } else {
-          console.log(`[poll] ${ticketId} already has Codex analysis comment — skipping enrich`);
+          console.log(`[poll] ${ticketId} already has Codex analysis — skipping enrich`);
         }
       }
     } catch (enrichErr: any) {
-      console.warn(`[poll] Enrich spawn failed for ${ticketId}:`, enrichErr.message);
+      console.warn(`[poll] Enrich spawn failed: ${enrichErr.message}`);
     }
 
     // ── Step 4: Label QA-ReCheck + move to In Review ──
@@ -332,60 +367,77 @@ async function processCommit(
         console.log(`[poll] ${ticketId} → In Review + QA-ReCheck`);
       }
     } catch (labelErr: any) {
-      console.warn(`[poll] Label/move failed for ${ticketId}: ${labelErr.message}`);
+      console.warn(`[poll] Label/move failed: ${labelErr.message}`);
     }
 
-    // ── Step 4: Wait for deploy ──
+    // ── Step 5: Wait for staging deploy; fall back to local server ──
     console.log(`[poll] Waiting for deploy (${short})...`);
-    await waitForDeploy(commitSha);
+    const deployed = await waitForDeploy(commitSha);
+    if (!deployed) {
+      console.log(`[poll] Staging not updated — falling back to local server`);
+      // Ping local dev server; if unreachable, note it in the comment but continue
+      const localUp = await fetch('http://localhost:5173', { signal: AbortSignal.timeout(3000) })
+        .then(r => r.ok).catch(() => false);
+      if (localUp) {
+        console.log(`[poll] Local dev server reachable — will use for DOM checks`);
+        process.env.STAGING_API_URL_OVERRIDE = 'http://localhost:5173';
+      } else {
+        console.log(`[poll] No local server either — code-only verify`);
+        process.env.STAGING_API_URL_OVERRIDE = '';
+      }
+    } else {
+      process.env.STAGING_API_URL_OVERRIDE = '';
+    }
 
-    // ── Step 5: Unified verify (code-level + live) + side-scan in parallel ──
+    // ── Step 6: Unified verify (code-level + live) + security/perf side-scan in parallel ──
     console.log(`[poll] Running unified verify + side-scan for ${ticketId}...`);
-
     const [verifyResult, sideFindings] = await Promise.all([
-      // Unified verification: Stage 1 (code) + Stage 2 (live app)
       runVerification(issue, { postComment: true, moveToDone: true }),
-      // Side-scan: security + performance (independent of ticket)
       runSideScans(commitSha, ticketId, filesChanged),
     ]);
 
-    // ── Step 6: File side-scan findings as separate tickets (deduplicated) ──
+    // ── Step 7: File side-scan findings (deduplicated); alert if high/critical ──
     let filedFindings: string[] = [];
+    let criticalFindings: CommitFinding[] = [];
     if (sideFindings.length > 0) {
       const { filed, skipped } = await fileCommitFindings(sideFindings, commitSha, ticketId);
       filedFindings = filed;
+      criticalFindings = sideFindings.filter(f => ['critical','high'].includes(f.severity));
       console.log(`[poll] Side-scan: filed=${filed.length}, skipped=${skipped}`);
     }
 
-    // ── Step 7: Slack alert ──
+    // ── Step 8: Slack alert to QA channel ──
+    const QA_CHANNEL = process.env.REGRESSION_SLACK_CHANNEL || 'C0AKXN13UB0';
     const verdictEmoji = verifyResult.verdict === 'pass' ? '✅' : verifyResult.verdict === 'fail' ? '❌' : '⚠️';
     const verdictLabel = verifyResult.verdict.toUpperCase();
-    const codeChecksCount = verifyResult.checks.filter(c => c.name.startsWith('[Code]')).length;
-    const liveChecksCount = verifyResult.checks.filter(c => !c.name.startsWith('[Code]')).length;
-    const findingsStr = filedFindings.length > 0 ? `\n🎫 ${filedFindings.length} finding(s) filed: ${filedFindings.join(', ')}` : '';
+    const codeChecks = verifyResult.checks.filter(c => c.name.startsWith('[Code]'));
+    const liveChecks = verifyResult.checks.filter(c => !c.name.startsWith('[Code]'));
+    const findingsStr = filedFindings.length > 0 ? `\n🎫 *${filedFindings.length} finding(s) filed:* ${filedFindings.join(', ')}` : '';
+    const createdStr = ticketCreated ? `\n🆕 Ticket auto-created (no existing ticket found)` : '';
 
-    const slackMsg = [
-      `${verdictEmoji} *${ticketId}* unified-verify *${verdictLabel}*`,
-      `Commit: <${commitUrl}|\`${short}\`> on \`${repoName}/${BRANCH}\``,
-      `🔍 Code checks: ${verifyResult.checks.filter(c => c.name.startsWith('[Code]') && c.status==='pass').length}✓ / ${codeChecksCount} total`,
-      `🧪 Live tests: ${verifyResult.summary.passed - verifyResult.checks.filter(c => c.name.startsWith('[Code]') && c.status==='pass').length}✓ ${verifyResult.summary.failed}✗ / ${liveChecksCount} total`,
-      `🔗 <${linearUrl}|View in Linear>${findingsStr}`,
+    const mainMsg = [
+      `${verdictEmoji} *${ticketId}* — *${verdictLabel}* | Commit <${commitUrl}|\`${short}\`> on \`${repoName}/${BRANCH}\``,
+      `🔍 Code: ${codeChecks.filter(c => c.status==='pass').length}✓ ${codeChecks.filter(c => c.status==='fail').length}✗ / ${codeChecks.length}  |  🧪 Live: ${liveChecks.filter(c => c.status==='pass').length}✓ ${liveChecks.filter(c => c.status==='fail').length}✗ / ${liveChecks.length}`,
+      `🔗 <${linearUrl}|View in Linear>${findingsStr}${createdStr}`,
     ].join('\n');
-    await slackAlert(slackMsg);
+    await slackAlertToChannel(mainMsg, QA_CHANNEL);
 
-    console.log(`[poll] ${ticketId} → ${verifyResult.verdict} (code+live unified, ${filedFindings.length} findings filed)`);
-    return {
-      ticketId,
-      verdict: verifyResult.verdict,
-      linearUrl,
-      codeChecks: codeChecksCount,
-      liveChecks: liveChecksCount,
-      findingsFiled: filedFindings.length,
-    };
+    // Extra alert for critical/high findings
+    if (criticalFindings.length > 0) {
+      const critMsg = [
+        `🚨 *Critical/High findings on \`${repoName}\` commit \`${short}\`*`,
+        criticalFindings.map(f => `• *[${f.severity.toUpperCase()}]* ${f.title}`).join('\n'),
+        `🔗 <${linearUrl}|${ticketId}> | <${commitUrl}|Commit>`,
+      ].join('\n');
+      await slackAlertToChannel(critMsg, QA_CHANNEL);
+    }
+
+    console.log(`[poll] ${ticketId} → ${verifyResult.verdict} (${filedFindings.length} findings filed)`);
+    return { ticketId, verdict: verifyResult.verdict, findingsFiled: filedFindings.length };
 
   } catch (err: any) {
     console.error(`[poll] Error processing ${ticketId}:`, err.message);
-    await slackAlert(`🚨 QA Shield unified-verify error for *${ticketId}*: ${err.message}\n<${commitUrl}|commit \`${short}\`>`);
+    await slackAlert(`🚨 QA Shield error for *${ticketId}*: ${err.message}\n<${commitUrl}|commit \`${short}\`>`);
     return { ticketId, verdict: 'error', error: err.message };
   }
 }
