@@ -178,7 +178,7 @@ export async function runVerification(
       await addComment(issue.id, comment);
       commentPosted = true;
 
-      if (moveToDone && verdict === 'pass') {
+      if (moveToDone && (verdict === 'pass' || verdict === 'partial')) {
         await updateIssueState(issue.id, WORKFLOW_STATES.DONE);
         movedToDone = true;
       }

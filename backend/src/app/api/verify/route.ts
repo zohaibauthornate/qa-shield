@@ -180,7 +180,7 @@ export async function POST(req: NextRequest) {
           await addComment(issue.id, comment);
           send('linear_update', { type: 'comment', ticket: identifier, message: 'Verification comment posted' });
 
-          if (verdict === 'pass') {
+          if (verdict === 'pass' || verdict === 'partial') {
             await updateIssueState(issue.id, WORKFLOW_STATES.DONE);
             send('linear_update', { type: 'status', ticket: identifier, message: `✅ ${identifier} → Done` });
           } else if (verdict === 'fail') {
