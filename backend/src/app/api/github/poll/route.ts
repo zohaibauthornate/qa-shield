@@ -433,7 +433,13 @@ async function processCommit(
     if (sideFindings.length > 0) {
       const { filed, skipped } = await fileCommitFindings(sideFindings, commitSha, ticketId);
       filedFindings = filed;
-      criticalFindings = sideFindings.filter(f => ['critical','high'].includes(f.severity));
+      // Only alert on findings that were NEWLY filed — not pre-existing/already-tracked ones
+      criticalFindings = sideFindings.filter(f =>
+        ['critical','high'].includes(f.severity) &&
+        filed.some((id: string) => f.title.includes(id.split('-')[1] || ''))
+      );
+      // Simpler: alert only when new tickets were actually created
+      if (filed.length === 0) criticalFindings = [];
       console.log(`[poll] Side-scan: filed=${filed.length}, skipped=${skipped}`);
 
       // Post side-scan summary as a comment on the ticket
