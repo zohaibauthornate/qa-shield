@@ -396,7 +396,7 @@ async function processCommit(
       runSideScans(commitSha, ticketId, filesChanged),
     ]);
 
-    // ── Step 7: File side-scan findings (deduplicated); alert if high/critical ──
+    // ── Step 7: Post security + perf scan results as comment on the ticket ──
     let filedFindings: string[] = [];
     let criticalFindings: CommitFinding[] = [];
     if (sideFindings.length > 0) {
@@ -404,6 +404,65 @@ async function processCommit(
       filedFindings = filed;
       criticalFindings = sideFindings.filter(f => ['critical','high'].includes(f.severity));
       console.log(`[poll] Side-scan: filed=${filed.length}, skipped=${skipped}`);
+
+      // Post side-scan summary as a comment on the ticket
+      const secFindings = sideFindings.filter(f => f.type === 'security');
+      const perfFindings = sideFindings.filter(f => f.type === 'performance');
+
+      const secLines = secFindings.length === 0
+        ? '✅ No security issues detected'
+        : secFindings.map(f => {
+            const icon = f.severity === 'critical' ? '🚨' : f.severity === 'high' ? '❌' : '⚠️';
+            return `${icon} **[${f.severity.toUpperCase()}]** ${f.title}`;
+          }).join('\n');
+
+      const perfLines = perfFindings.length === 0
+        ? '✅ No performance regressions detected'
+        : perfFindings.map(f => {
+            const icon = f.severity === 'critical' ? '🚨' : f.severity === 'high' ? '❌' : '⚠️';
+            return `${icon} **[${f.severity.toUpperCase()}]** ${f.title}`;
+          }).join('\n');
+
+      const newTicketsStr = filedFindings.length > 0
+        ? `\n\n**New tickets filed:** ${filedFindings.join(', ')}`
+        : '\n\n**No new tickets filed** (all findings already tracked)';
+
+      const sideScanComment = [
+        `## 🔍 Security & Performance Scan — Commit \`${short}\``,
+        `> Automated scan run alongside verification of this commit on \`${repoName}/${BRANCH}\``,
+        '',
+        '### 🔒 Security',
+        secLines,
+        '',
+        '### ⚡ Performance',
+        perfLines,
+        newTicketsStr,
+        '',
+        `*Scanned: ${new Date().toISOString()} | Commit: [${short}](${commitUrl})*`,
+      ].join('\n');
+
+      try {
+        await addComment(issue.id, sideScanComment);
+        console.log(`[poll] Side-scan comment posted to ${ticketId}`);
+      } catch (commentErr: any) {
+        console.warn(`[poll] Failed to post side-scan comment: ${commentErr.message}`);
+      }
+    } else {
+      // Post clean scan result too
+      try {
+        await addComment(issue.id, [
+          `## 🔍 Security & Performance Scan — Commit \`${short}\``,
+          `> Automated scan run alongside verification on \`${repoName}/${BRANCH}\``,
+          '',
+          '### 🔒 Security',
+          '✅ No security issues detected',
+          '',
+          '### ⚡ Performance',
+          '✅ No performance regressions detected',
+          '',
+          `*Scanned: ${new Date().toISOString()} | Commit: [${short}](${commitUrl})*`,
+        ].join('\n'));
+      } catch { /* non-fatal */ }
     }
 
     // ── Step 8: Slack alert — ONLY for critical/high security+perf findings ──
