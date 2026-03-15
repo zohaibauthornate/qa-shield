@@ -15,7 +15,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { promises as fs } from 'fs';
 import { runCommitAnalysis } from '@/lib/commit-runner';
 import { fileCommitFindings, type CommitFinding } from '@/lib/guardian';
+import { scanEndpoint, apiLevelBenchmark } from '@/lib/scanner';
 import { spawnCodexEnrich, getJobByIdentifier } from '@/lib/codex-background';
+import { runVerification } from '@/lib/verify-runner';
 import {
   getIssueByIdentifier,
   addComment,
@@ -49,7 +51,7 @@ async function acquireLock(): Promise<boolean> {
     if (lockData) {
       const { pid, startedAt } = JSON.parse(lockData);
       const ageMs = Date.now() - new Date(startedAt).getTime();
-      if (ageMs < 4 * 60 * 1000) { // lock valid for 4 min max
+      if (ageMs < 15 * 60 * 1000) { // lock valid for 15 min max (runs can take ~5-10 min)
         console.log(`[poll] Already running (pid ${pid}, ${Math.round(ageMs/1000)}s ago) — skipping`);
         return false;
       }
@@ -75,8 +77,20 @@ interface PollState {
 async function loadState(): Promise<PollState> {
   try {
     const raw = await fs.readFile(STATE_FILE, 'utf8');
-    return JSON.parse(raw);
-  } catch {
+    if (!raw || !raw.trim()) {
+      // Empty file — do NOT treat as fresh start. Log and return safe default.
+      console.warn('[poll] State file is empty — starting fresh (no commits will be re-processed after this run)');
+      return { lastSeenShas: {}, processedTickets: {} };
+    }
+    const parsed = JSON.parse(raw);
+    // Validate shape
+    if (typeof parsed !== 'object' || !parsed.lastSeenShas || !parsed.processedTickets) {
+      console.warn('[poll] State file corrupted — resetting');
+      return { lastSeenShas: {}, processedTickets: {} };
+    }
+    return parsed;
+  } catch (err: any) {
+    console.warn('[poll] Could not load state file:', err.message, '— starting fresh');
     return { lastSeenShas: {}, processedTickets: {} };
   }
 }
@@ -188,7 +202,75 @@ function buildSlackMsg(
   return msg;
 }
 
-// ── Process a commit: analyze diff → run targeted checks → post to Linear ──
+// ── Run security + performance side-scan (parallel to ticket verify) ──
+async function runSideScans(
+  commitSha: string,
+  ticketId: string | undefined,
+  filesChanged: { filename: string }[]
+): Promise<CommitFinding[]> {
+  const findings: CommitFinding[] = [];
+
+  try {
+    // Infer which API endpoints to check based on changed files
+    const SCAN_ENDPOINTS = [
+      '/api/token/list?limit=5',
+      '/api/token?address=3jHkaVj9392sasDhVWivWyW8UYY3cfRCRJg3eEprDH7Q',
+      '/api/leaderboard/stats',
+      '/api/profile/stats/trading?wallet=7A6jxEcFDzLfVBFSJrqLz5LkJTW8aM7WjNL2jgP1gfP',
+    ];
+    const API_BASE = process.env.STAGING_API_URL || 'https://dev.bep.creator.fun';
+
+    // Security + performance in parallel
+    const [secResults, perfResults] = await Promise.all([
+      Promise.all(SCAN_ENDPOINTS.slice(0, 2).map(ep => scanEndpoint(`${API_BASE}${ep}`))),
+      apiLevelBenchmark(2), // 2 samples for speed during ticket testing
+    ]);
+
+    // Collect security findings
+    for (const sec of secResults) {
+      const failedChecks = sec.checks.filter(c => c.status === 'fail');
+      for (const check of failedChecks) {
+        const isCritical = check.severity === 'critical' || check.severity === 'high';
+        findings.push({
+          type: 'security',
+          endpoint: sec.endpoint,
+          title: `[Security] ${check.type.toUpperCase()} — ${sec.endpoint.replace(API_BASE, '')}`,
+          description: `**Security issue detected alongside commit \`${commitSha.slice(0, 7)}\`**\n\n**Endpoint:** \`${sec.endpoint}\`\n**Check:** ${check.type}\n**Finding:** ${check.details}\n\n**Steps to verify:**\n1. \`curl -H "Origin: https://evil-site.example.com" ${sec.endpoint}\`\n2. Check response headers for ACAO, HSTS, X-Content-Type-Options`,
+          severity: isCritical ? 'high' : 'medium',
+        });
+      }
+    }
+
+    // Collect performance findings
+    for (const perf of perfResults) {
+      if (perf.ourAvg <= PERF_THRESHOLD_MS || perf.ourAvg < 0) continue;
+      const fastest = COMPETITORS.sort((a, b) => a.avgMs - b.avgMs)[0];
+      const deltaPct = Math.round(((perf.ourAvg - fastest.avgMs) / fastest.avgMs) * 100);
+      const severity = perf.ourAvg >= PERF_CRITICAL_MS ? 'critical' : perf.ourAvg >= 500 ? 'high' : 'medium';
+      const endpointPath = perf.ourEndpoint;
+      findings.push({
+        type: 'performance',
+        endpoint: `${API_BASE}${endpointPath}`,
+        title: `[Performance] ${endpointPath} — ${perf.ourAvg}ms avg (${deltaPct}% slower than ${fastest.name})`,
+        description: `**Performance issue detected alongside commit \`${commitSha.slice(0, 7)}\`**\n\n**Endpoint:** \`${endpointPath}\`\n\n| Metric | Value |\n|--------|-------|\n| Our Avg Response | ${perf.ourAvg}ms |\n| Our P95 | ${perf.ourP95}ms |\n| ${fastest.name} | ~${fastest.avgMs}ms |\n| Delta | +${deltaPct}% slower |\n| Industry Standard | <200ms (RAIL model) |\n\n**Why this matters:** Trading platforms need sub-200ms API responses. Slow endpoints reduce user trust and increase bounce rate.`,
+        severity,
+        ourAvgMs: perf.ourAvg,
+        competitorAvgMs: fastest.avgMs,
+        competitorName: fastest.name,
+        deltaPct,
+      });
+    }
+  } catch (err: any) {
+    console.warn(`[poll] Side-scan error for ${ticketId || 'no-ticket'}:`, err.message);
+  }
+
+  return findings;
+}
+
+// ── Process a commit: unified flow ──
+// 1. Check if Linear ticket exists for the commit
+// 2. If YES → unified verify (code-level + live app) + side-scan security/perf in parallel
+// 3. If NO ticket → still run security + performance scan, file findings if new
 async function processCommit(
   ticketId: string,
   commitSha: string,
@@ -198,125 +280,112 @@ async function processCommit(
   filesChanged: { filename: string; status: string; additions: number; deletions: number; patch?: string }[]
 ) {
   const linearUrl = `https://linear.app/creatorfun/issue/${ticketId}`;
+  const short = commitSha.slice(0, 7);
+  const repoName = repo.split('/')[1];
+  const commitUrl = `https://github.com/${repo}/commit/${commitSha}`;
+
   try {
+    // ── Step 1: Check if ticket exists in Linear ──
     const issue = await getIssueByIdentifier(ticketId);
+
     if (!issue) {
-      console.log(`[poll] ${ticketId} not found in Linear — skipping`);
-      return { ticketId, verdict: 'skipped', error: 'Not found in Linear' };
+      // No ticket found — log and skip. Security+perf scanning is tied to ticket verification.
+      console.log(`[poll] ${ticketId} NOT found in Linear — skipping (no ticket to verify against)`);
+      return { ticketId, verdict: 'no-ticket' };
     }
 
-    // ── Trigger async Codex enrichment — only once per ticket (skip if already done) ──
+    // ── Step 2: Skip Done tickets entirely ──
+    const currentState = (issue as any).state?.name || '';
+    if (currentState === 'Done') {
+      console.log(`[poll] ${ticketId} is already Done — skipping analysis + verification`);
+      return { ticketId, verdict: 'already-done' };
+    }
+
+    // ── Step 3: Ticket found — trigger Codex enrichment (once per commit SHA) ──
+    // Guard: check in-memory job AND whether a Codex comment already exists on the ticket
     try {
       const existingJob = getJobByIdentifier(ticketId);
-      if (existingJob && (existingJob.status === 'done' || existingJob.status === 'running' || existingJob.status === 'queued')) {
-        console.log(`[poll] Codex enrichment already ${existingJob.status} for ${ticketId} — skipping`);
-      } else {
-        spawnCodexEnrich(ticketId, JSON.stringify(issue), JSON.stringify(null), true);
-        console.log(`[poll] Codex enrichment queued for ${ticketId}`);
+      const alreadyEnriched = existingJob && ['done','running','queued'].includes(existingJob.status);
+      if (!alreadyEnriched) {
+        // Also check if a Codex analysis comment already exists (survives restarts)
+        const comments = (issue as any).comments?.nodes || [];
+        const hasCodexComment = comments.some((c: any) =>
+          c.body?.includes('QA Shield — Ticket Analysis (Codex)') ||
+          c.body?.includes('Ticket Analysis (Codex)')
+        );
+        if (!hasCodexComment) {
+          spawnCodexEnrich(ticketId, JSON.stringify(issue), JSON.stringify(null), true);
+          console.log(`[poll] Codex enrichment queued for ${ticketId}`);
+        } else {
+          console.log(`[poll] ${ticketId} already has Codex analysis comment — skipping enrich`);
+        }
       }
     } catch (enrichErr: any) {
       console.warn(`[poll] Enrich spawn failed for ${ticketId}:`, enrichErr.message);
     }
 
-    // Auto-label QA-ReCheck + move to In Review
+    // ── Step 4: Label QA-ReCheck + move to In Review ──
     try {
       await addLabel(issue.id, [LABELS.QA_RECHECK]);
-      const currentState = (issue as any).state?.name || '';
       if (!['In Review', 'Done'].includes(currentState)) {
         await updateIssueState(issue.id, WORKFLOW_STATES.IN_REVIEW);
-        console.log(`[poll] ${ticketId} → In Review + QA-ReCheck label`);
+        console.log(`[poll] ${ticketId} → In Review + QA-ReCheck`);
       }
     } catch (labelErr: any) {
       console.warn(`[poll] Label/move failed for ${ticketId}: ${labelErr.message}`);
     }
 
-    // Wait for deploy
-    console.log(`[poll] Waiting for deploy (${commitSha.slice(0, 7)})...`);
+    // ── Step 4: Wait for deploy ──
+    console.log(`[poll] Waiting for deploy (${short})...`);
     await waitForDeploy(commitSha);
 
-    // Run commit analysis — maps files → targeted checks → runs everything
-    console.log(`[poll] Running commit analysis for ${ticketId} (${filesChanged.length} files)...`);
-    const result = await runCommitAnalysis(
-      commitSha,
-      commitMessage,
-      author,
-      repo,
-      filesChanged as any,
-      ticketId,           // posts comment + moves state automatically
-      issue.title,        // passed to AI for better test case generation
-      issue.description || undefined
-    );
+    // ── Step 5: Unified verify (code-level + live) + side-scan in parallel ──
+    console.log(`[poll] Running unified verify + side-scan for ${ticketId}...`);
 
-    // ── Extract + file security findings as separate Linear tickets ──
-    const commitFindings: CommitFinding[] = [];
+    const [verifyResult, sideFindings] = await Promise.all([
+      // Unified verification: Stage 1 (code) + Stage 2 (live app)
+      runVerification(issue, { postComment: true, moveToDone: true }),
+      // Side-scan: security + performance (independent of ticket)
+      runSideScans(commitSha, ticketId, filesChanged),
+    ]);
 
-    for (const sec of result.secResults) {
-      for (const issue of sec.issues) {
-        const isCritical = issue.toLowerCase().includes('cors') || issue.toLowerCase().includes('auth');
-        commitFindings.push({
-          type: 'security',
-          endpoint: sec.endpoint,
-          title: `[Security] ${issue.split(':')[0].trim()} — ${sec.endpoint.replace('https://dev.bep.creator.fun', '')}`,
-          description: `**Security issue detected on \`pre-staging\` commit \`${commitSha.slice(0,7)}\`**\n\n**Endpoint:** \`${sec.endpoint}\`\n**Finding:** ${issue}\n\n**Steps to verify:**\n1. \`curl -H "Origin: https://evil-site.example.com" ${sec.endpoint}\`\n2. Check response headers for ACAO, HSTS, X-Content-Type-Options`,
-          severity: isCritical ? 'high' : 'medium',
-        });
-      }
+    // ── Step 6: File side-scan findings as separate tickets (deduplicated) ──
+    let filedFindings: string[] = [];
+    if (sideFindings.length > 0) {
+      const { filed, skipped } = await fileCommitFindings(sideFindings, commitSha, ticketId);
+      filedFindings = filed;
+      console.log(`[poll] Side-scan: filed=${filed.length}, skipped=${skipped}`);
     }
 
-    // ── Extract + file performance findings vs industry standards ──
-    for (const perf of result.perfResults) {
-      if (perf.ourMs <= PERF_THRESHOLD_MS) continue; // within acceptable range
-      const fastest = COMPETITORS.sort((a, b) => a.avgMs - b.avgMs)[0];
-      const deltaPct = Math.round(((perf.ourMs - fastest.avgMs) / fastest.avgMs) * 100);
-      const severity = perf.ourMs >= PERF_CRITICAL_MS ? 'critical' : perf.ourMs >= 500 ? 'high' : 'medium';
-      const endpointPath = perf.endpoint.replace('https://dev.bep.creator.fun', '');
+    // ── Step 7: Slack alert ──
+    const verdictEmoji = verifyResult.verdict === 'pass' ? '✅' : verifyResult.verdict === 'fail' ? '❌' : '⚠️';
+    const verdictLabel = verifyResult.verdict.toUpperCase();
+    const codeChecksCount = verifyResult.checks.filter(c => c.name.startsWith('[Code]')).length;
+    const liveChecksCount = verifyResult.checks.filter(c => !c.name.startsWith('[Code]')).length;
+    const findingsStr = filedFindings.length > 0 ? `\n🎫 ${filedFindings.length} finding(s) filed: ${filedFindings.join(', ')}` : '';
 
-      commitFindings.push({
-        type: 'performance',
-        endpoint: perf.endpoint,
-        title: `[Performance] ${endpointPath} — ${perf.ourMs}ms avg (${deltaPct}% slower than ${fastest.name})`,
-        description: `**Performance regression detected on \`pre-staging\`**\n\n**Endpoint:** \`${endpointPath}\`\n\n| Metric | Value |\n|--------|-------|\n| Our Avg Response | ${perf.ourMs}ms |\n| ${fastest.name} | ${fastest.avgMs}ms |\n| Delta | +${deltaPct}% slower |\n| Industry Standard | <200ms (RAIL model) |\n\n**Competitors for reference:**\n${COMPETITORS.map(c => `- ${c.name}: ~${c.avgMs}ms avg`).join('\n')}\n\n**Why this matters:** Trading platforms need sub-200ms API responses. Slow endpoints reduce user trust and increase bounce rate on key actions.`,
-        severity,
-        ourAvgMs: perf.ourMs,
-        competitorAvgMs: fastest.avgMs,
-        competitorName: fastest.name,
-        deltaPct,
-      });
-    }
-
-    // File all findings as separate Linear tickets (deduplicated)
-    if (commitFindings.length > 0) {
-      const { filed, skipped } = await fileCommitFindings(commitFindings, commitSha, ticketId);
-      if (filed.length > 0) {
-        console.log(`[poll] Filed ${filed.length} finding tickets: ${filed.join(', ')}`);
-      }
-      if (skipped > 0) {
-        console.log(`[poll] Skipped ${skipped} duplicate findings`);
-      }
-    }
-
-    // ── Slack alert ──
-    const short = commitSha.slice(0, 7);
-    const repoName = repo.split('/')[1];
-    const commitUrl = `https://github.com/${repo}/commit/${commitSha}`;
-    const verdictEmoji = result.verdict === 'pass' ? '✅' : result.verdict === 'fail' ? '❌' : '⚠️';
-    const areasSummary = result.analysis.impactAreas.map(a => a.feature).slice(0, 3).join(', ');
-    const newTicketsStr = commitFindings.length > 0 ? `\n🎫 ${commitFindings.length} finding(s) filed as separate tickets` : '';
     const slackMsg = [
-      `${verdictEmoji} *${ticketId}* commit-analysis *${result.verdict.toUpperCase()}*`,
+      `${verdictEmoji} *${ticketId}* unified-verify *${verdictLabel}*`,
       `Commit: <${commitUrl}|\`${short}\`> on \`${repoName}/${BRANCH}\``,
-      `Impact: ${result.analysis.impactAreas.length} area(s) — ${areasSummary || 'none detected'}`,
-      `Checks: ${result.domResults.reduce((s, r) => s + r.passed, 0)}✓ DOM, ${result.apiResults.filter(r => r.ok).length}✓ API${newTicketsStr}`,
-      `🔗 <${linearUrl}|View in Linear>`,
+      `🔍 Code checks: ${verifyResult.checks.filter(c => c.name.startsWith('[Code]') && c.status==='pass').length}✓ / ${codeChecksCount} total`,
+      `🧪 Live tests: ${verifyResult.summary.passed - verifyResult.checks.filter(c => c.name.startsWith('[Code]') && c.status==='pass').length}✓ ${verifyResult.summary.failed}✗ / ${liveChecksCount} total`,
+      `🔗 <${linearUrl}|View in Linear>${findingsStr}`,
     ].join('\n');
     await slackAlert(slackMsg);
 
-    console.log(`[poll] ${ticketId} → ${result.verdict} (${result.analysis.impactAreas.length} areas, ${result.analysis.allPages.length} pages)`);
-    return { ticketId, verdict: result.verdict, linearUrl, impactAreas: result.analysis.impactAreas.length };
+    console.log(`[poll] ${ticketId} → ${verifyResult.verdict} (code+live unified, ${filedFindings.length} findings filed)`);
+    return {
+      ticketId,
+      verdict: verifyResult.verdict,
+      linearUrl,
+      codeChecks: codeChecksCount,
+      liveChecks: liveChecksCount,
+      findingsFiled: filedFindings.length,
+    };
 
   } catch (err: any) {
     console.error(`[poll] Error processing ${ticketId}:`, err.message);
-    await slackAlert(`🚨 QA Shield commit-analysis error for *${ticketId}*: ${err.message}`);
+    await slackAlert(`🚨 QA Shield unified-verify error for *${ticketId}*: ${err.message}\n<${commitUrl}|commit \`${short}\`>`);
     return { ticketId, verdict: 'error', error: err.message };
   }
 }
@@ -376,7 +445,11 @@ export async function POST(req: NextRequest) {
           console.log(`[poll] ${ticketId}/${commit.sha.slice(0, 7)} already processed — skipping`);
           continue;
         }
-        state.processedTickets[ticketId] = [...processedShas, commit.sha].slice(-20); // keep last 20 SHAs per ticket
+        // ⚠️ CRITICAL: Mark SHA as processed and persist BEFORE running analysis.
+        // If the run crashes mid-way, the state is already saved and we won't re-process on next poll.
+        state.processedTickets[ticketId] = [...processedShas, commit.sha].slice(-50); // keep last 50 SHAs per ticket
+        await saveState(state); // persist immediately — do not wait until end of all processing
+        console.log(`[poll] ${ticketId}/${commit.sha.slice(0, 7)} marked as processed — running analysis`);
         const result = await processCommit(ticketId, commit.sha, commit.message, commit.author, repo, filesChanged);
         results.push({ repo, ...result });
       }

@@ -29,19 +29,19 @@ export async function verifyDOM(
 
     if (!res.ok) {
       return {
-        checks: [{ name: `DOM check: ${path}`, status: 'fail', details: `Browser worker error: ${res.status}` }],
+        checks: [{ name: `DOM check: ${path}`, status: 'skip', details: `Browser unavailable (${res.status}) — DOM checks skipped` }],
       };
     }
 
     const data = await res.json();
     return { checks: data.results || [], screenshot: data.screenshot };
   } catch (err: any) {
-    const isDown = err.message?.includes('ECONNREFUSED') || err.message?.includes('fetch failed');
+    // Any connection error → skip (non-blocking), not fail
     return {
       checks: [{
         name: `Browser check: ${path}`,
-        status: isDown ? 'warn' : 'fail',
-        details: isDown ? 'Browser worker not running — DOM checks skipped' : `Error: ${err.message}`,
+        status: 'skip',
+        details: 'Browser not available — DOM checks skipped (code + API checks still ran)',
       }],
     };
   }

@@ -1,5 +1,5 @@
 /**
- * QA Shield v0.4 — Linear Content Script
+ * QA Shield v0.5 — Linear Content Script
  * SSE streaming for real-time updates, ticket ID tracking, security labels
  * Sprint 4: new benchmark UI, regression/payload/load sections, Full Scan button
  */
@@ -24,7 +24,7 @@ function createSidebar() {
     <div class="qs-header">
       <span class="qs-logo">🛡️</span>
       <span class="qs-title">QA Shield</span>
-      <span class="qs-version">v0.4</span>
+      <span class="qs-version">v0.5</span>
       <button class="qs-close" id="qs-close-btn">×</button>
     </div>
     <div class="qs-content" id="qs-content">
@@ -975,7 +975,7 @@ function init() {
   const identifier = getIssueIdentifier();
   if (identifier) {
     createSidebar();
-    console.log(`[QA Shield] 🛡️ v0.3 Active on ${identifier}`);
+    console.log(`[QA Shield] 🛡️ v0.5 Active on ${identifier}`);
   }
 }
 

@@ -11,6 +11,7 @@ import {
 } from '@/lib/linear';
 import { verifyAPI, verifyDOM, verifyQuickBuy, type VerifyCheck } from '@/lib/verifier';
 import { getTicketContext, formatGitHubContextForComment, type GitHubContext } from '@/lib/github';
+import { verifyCodeChanges, inferRepo, type CodeCheck } from '@/lib/code-verifier';
 
 const STAGING_API_BASE = process.env.STAGING_API_URL || 'https://dev.bep.creator.fun';
 const BROWSER_WORKER = process.env.BROWSER_WORKER_URL || 'http://127.0.0.1:3099';
@@ -46,6 +47,12 @@ export interface VerificationPlan {
   crossChecks: CrossCheck[];
   transactionCheck?: { tokenAddress: string; amount: number };
   reasoning: string;
+  /** Stage 1: code-level checks to confirm fix is present in the repo before running live tests */
+  codeChecks?: {
+    repo: string;
+    branch: string;
+    checks: CodeCheck[];
+  };
 }
 
 // ============ Main Runner ============
@@ -69,6 +76,32 @@ export async function runVerification(
     const plan = await buildVerificationPlan(issue, githubCtx ?? undefined);
     const allChecks: VerifyCheck[] = [];
 
+    // ── Stage 1: Code-level verification ──
+    // Confirm the fix is actually present in the repo before running live tests
+    let codeVerifyNote = '';
+    if (plan.codeChecks?.checks?.length) {
+      console.log(`[verify-runner] Running ${plan.codeChecks.checks.length} code checks on ${plan.codeChecks.repo}@${plan.codeChecks.branch}`);
+      try {
+        const codeResult = await verifyCodeChanges(plan.codeChecks.repo, plan.codeChecks.branch, plan.codeChecks.checks);
+        for (const r of codeResult.checks) {
+          allChecks.push({
+            name: `[Code] ${r.description}`,
+            status: r.status === 'pass' ? 'pass' : r.status === 'warn' ? 'warn' : 'fail',
+            details: r.details || '',
+          });
+        }
+        if (!codeResult.allPassed && !codeResult.someWarned) {
+          codeVerifyNote = '⚠️ Code changes NOT found in pre-staging — fix may not be merged yet. Live tests may be unreliable.';
+        } else if (codeResult.allPassed && !codeResult.someWarned) {
+          codeVerifyNote = '✅ Code changes confirmed present in pre-staging.';
+        }
+      } catch (codeErr: any) {
+        console.warn('[verify-runner] Code verification error:', codeErr.message);
+        allChecks.push({ name: '[Code] Code verification', status: 'warn', details: `Code check failed: ${codeErr.message}` });
+      }
+    }
+
+    // ── Stage 2: Live app checks ──
     // API checks (parallel)
     if (plan.apiChecks.length > 0) {
       const apiResultGroups = await Promise.all(
@@ -136,7 +169,7 @@ export async function runVerification(
     let movedToDone = false;
 
     if (postComment) {
-      let comment = formatVerificationComment(issue, allChecks, verdict, plan);
+      let comment = formatVerificationComment(issue, allChecks, verdict, plan, codeVerifyNote);
       if (githubCtx) comment += '\n\n' + formatGitHubContextForComment(githubCtx);
       // Append screenshot note if we have failure screenshots
       if (failureScreenshots.length > 0) {
@@ -316,8 +349,17 @@ Working API endpoints (staging: https://dev.bep.creator.fun):
 CSS color checks: use action:"style" with selector to verify computed styles.
 For visibility: use action:"visible" or action:"hidden".
 
+CODE CHECKS:
+You MUST also generate "codeChecks" to verify the fix is present in the GitHub repo.
+- For each code change in the ticket/diff: add one check with the key pattern
+- type="removed": pattern should NOT be in file (e.g. deleted import, removed call)
+- type="added": pattern MUST be in file (e.g. new function, new prop)
+- Infer repo: if filenames start with src/pages/, src/hooks/, src/components/ → "creatorfun/frontend"; backend files → "creatorfun/backend-persistent"
+- branch is always "pre-staging"
+- Use short, specific patterns (not full lines — just the distinctive string)
+
 Respond ONLY with valid JSON (no markdown):
-{"reasoning":"1-2 sentences on what changed and what you're checking","apiChecks":[{"endpoint":"/api/path","checks":[{"field":"data.0.name","exists":true}]}],"domChecks":[{"path":"/correct-page","checks":[{"name":"Descriptive check name","selector":"CSS selector","action":"exists|text|visible|hidden|style"}]}],"crossChecks":[],"transactionCheck":null}`;
+{"reasoning":"1-2 sentences on what changed and what you're checking","codeChecks":{"repo":"creatorfun/frontend","branch":"pre-staging","checks":[{"description":"useWebsocketOrders import removed","file":"src/pages/details/sections/FinanceSection.tsx","type":"removed","pattern":"useWebsocketOrders"}]},"apiChecks":[{"endpoint":"/api/path","checks":[{"field":"data.0.name","exists":true}]}],"domChecks":[{"path":"/correct-page","checks":[{"name":"Descriptive check name","selector":"CSS selector","action":"exists|text|visible|hidden|style"}]}],"crossChecks":[],"transactionCheck":null}`;
 
   const userContent = `TICKET: ${issue.identifier}: ${issue.title}\n\nDESCRIPTION:\n${(issue.description || 'No description').substring(0, 800)}\n\nLabels: ${issue.labels?.nodes?.map((l: any) => l.name).join(', ') || 'none'}\nDev comments: ${issue.comments?.nodes?.map((c: any) => `[${c.user?.name}]: ${c.body?.substring(0, 300)}`).join('\n') || 'None'}${githubSection}${diffContext}`;
 
@@ -342,6 +384,7 @@ Respond ONLY with valid JSON (no markdown):
         crossChecks: parsed.crossChecks || [],
         transactionCheck: parsed.transactionCheck || undefined,
         reasoning: parsed.reasoning || 'OpenAI-generated plan',
+        codeChecks: parsed.codeChecks?.checks?.length ? parsed.codeChecks : undefined,
       };
     } catch (err: any) {
       console.warn('[verify-runner] OpenAI failed, trying Chief QA proxy:', err.message);
@@ -376,7 +419,51 @@ Respond ONLY with valid JSON (no markdown):
 
   // Pre-warm live token cache before fallback runs
   await getLiveTokenAddress().catch(() => {});
-  return buildFallbackPlan(issue);
+  const fallbackPlan = buildFallbackPlan(issue);
+
+  // Even in fallback: derive code checks from GitHub diff if available
+  if (githubCtx?.hasChanges && githubCtx.allFilesChanged.length > 0) {
+    const branch = process.env.GITHUB_BRANCH || 'pre-staging';
+    const repo = inferRepo(githubCtx.allFilesChanged.map(f => f.filename));
+    const codeChecks: CodeCheck[] = [];
+
+    for (const file of githubCtx.allFilesChanged.slice(0, 5)) {
+      if (!file.patch) continue;
+      // Extract removed lines (- lines in diff that are not @@ headers)
+      const removedLines = file.patch.split('\n')
+        .filter(l => l.startsWith('-') && !l.startsWith('---'))
+        .map(l => l.slice(1).trim())
+        .filter(l => l.length > 8 && !l.startsWith('//') && !l.startsWith('*'));
+      // Extract added lines
+      const addedLines = file.patch.split('\n')
+        .filter(l => l.startsWith('+') && !l.startsWith('+++'))
+        .map(l => l.slice(1).trim())
+        .filter(l => l.length > 8 && !l.startsWith('//') && !l.startsWith('*'));
+
+      // Pick most distinctive removed/added patterns (imports, function names, key identifiers)
+      const distinctiveRemoved = removedLines
+        .filter(l => /import|export|function|const |interface |type |class /.test(l))
+        .slice(0, 2);
+      const distinctiveAdded = addedLines
+        .filter(l => /import|export|function|const |interface |type |class /.test(l))
+        .slice(0, 2);
+
+      for (const line of distinctiveRemoved) {
+        const pattern = line.length > 60 ? line.slice(0, 60) : line;
+        codeChecks.push({ description: `Removed: "${pattern.slice(0, 50)}..."`, file: file.filename, type: 'removed', pattern });
+      }
+      for (const line of distinctiveAdded) {
+        const pattern = line.length > 60 ? line.slice(0, 60) : line;
+        codeChecks.push({ description: `Added: "${pattern.slice(0, 50)}..."`, file: file.filename, type: 'added', pattern });
+      }
+    }
+
+    if (codeChecks.length > 0) {
+      fallbackPlan.codeChecks = { repo, branch, checks: codeChecks.slice(0, 8) };
+    }
+  }
+
+  return fallbackPlan;
 }
 
 
@@ -385,7 +472,7 @@ Respond ONLY with valid JSON (no markdown):
 let _liveTokenCache: { address: string; fetchedAt: number } | null = null;
 
 async function getLiveTokenAddress(): Promise<string> {
-  const FALLBACK = '3XPMWxzpUuUZkMH9cGTw8bLFZsZnzdBoLfteVgu8WgQj';
+  const FALLBACK = '3jHkaVj9392sasDhVWivWyW8UYY3cfRCRJg3eEprDH7Q';
   const now = Date.now();
   if (_liveTokenCache && now - _liveTokenCache.fetchedAt < 10 * 60 * 1000) {
     return _liveTokenCache.address;
@@ -408,7 +495,7 @@ export function buildFallbackPlan(issue: LinearIssue): VerificationPlan {
   const combined = `${issue.title} ${issue.description || ''}`.toLowerCase();
   const plan: VerificationPlan = { apiChecks: [], domChecks: [], crossChecks: [], reasoning: '' };
   // Use cached live token (resolved async before calling this — see buildVerificationPlan)
-  const TOKEN_ADDR = _liveTokenCache?.address || '3XPMWxzpUuUZkMH9cGTw8bLFZsZnzdBoLfteVgu8WgQj';
+  const TOKEN_ADDR = _liveTokenCache?.address || '3jHkaVj9392sasDhVWivWyW8UYY3cfRCRJg3eEprDH7Q';
   const API = 'https://dev.bep.creator.fun';
 
   const matched: string[] = [];
@@ -613,12 +700,17 @@ export function formatVerificationComment(
   issue: { identifier: string; title: string },
   checks: VerifyCheck[],
   verdict: string,
-  plan: VerificationPlan
+  plan: VerificationPlan,
+  codeVerifyNote?: string
 ): string {
   const now = new Date().toISOString();
   const passed = checks.filter(c => c.status === 'pass');
   const failed = checks.filter(c => c.status === 'fail');
   const warned = checks.filter(c => c.status === 'warn');
+
+  // Separate code-level from live checks
+  const codeChecks = checks.filter(c => c.name.startsWith('[Code]'));
+  const liveChecks = checks.filter(c => !c.name.startsWith('[Code]'));
 
   // Verdict block
   const verdictIcon = verdict === 'pass' ? '✅' : verdict === 'fail' ? '❌' : '⚠️';
@@ -640,22 +732,37 @@ export function formatVerificationComment(
 ${plan.reasoning}
 
 ### 📊 Results Summary
-| Total | ✅ Passed | ❌ Failed | ⚠️ Warned |
-|-------|-----------|-----------|-----------|
-| ${checks.length} | ${passed.length} | ${failed.length} | ${warned.length} |
+| | Total | ✅ Passed | ❌ Failed | ⚠️ Warned |
+|---|-------|-----------|-----------|-----------|
+| 🔍 Code checks | ${codeChecks.length} | ${codeChecks.filter(c=>c.status==='pass').length} | ${codeChecks.filter(c=>c.status==='fail').length} | ${codeChecks.filter(c=>c.status==='warn').length} |
+| 🧪 Live tests | ${liveChecks.length} | ${liveChecks.filter(c=>c.status==='pass').length} | ${liveChecks.filter(c=>c.status==='fail').length} | ${liveChecks.filter(c=>c.status==='warn').length} |
+| **Total** | **${checks.length}** | **${passed.length}** | **${failed.length}** | **${warned.length}** |
 
+${codeVerifyNote ? `> ${codeVerifyNote}\n` : ''}
 `;
 
-  // Detailed test cases
-  if (checks.length > 0) {
-    out += `### 🔍 Test Cases Executed\n\n`;
-
-    checks.forEach((ch, i) => {
+  // ── Stage 1: Code verification results ──
+  if (codeChecks.length > 0) {
+    out += `### 🔍 Stage 1 — Code Verification (GitHub \`${plan.codeChecks?.branch || 'pre-staging'}\`)\n\n`;
+    out += `| # | Check | File | Result |\n|---|---|---|---|\n`;
+    codeChecks.forEach((ch, i) => {
       const icon = ch.status === 'pass' ? '✅' : ch.status === 'fail' ? '❌' : '⚠️';
-      // Parse name to detect type: API vs DOM
-      const isApi = ch.name.toLowerCase().includes('http') || ch.name.toLowerCase().includes('get ') || ch.name.toLowerCase().includes('post ') || ch.name.toLowerCase().includes('api');
-      const type = isApi ? '`API`' : '`UI`';
+      const cleanName = ch.name.replace('[Code] ', '');
+      const file = plan.codeChecks?.checks?.[i]?.file?.split('/').pop() || '';
+      out += `| ${i + 1} | ${cleanName} | \`${file}\` | ${icon} ${ch.status.toUpperCase()} |\n`;
+      if (ch.status !== 'pass') out += `| | | | *${ch.details}* |\n`;
+    });
+    out += '\n';
+  }
 
+  // ── Stage 2: Live app test results ──
+  out += `### 🧪 Stage 2 — Live App Tests (dev.creator.fun)\n\n`;
+
+  if (liveChecks.length > 0) {
+    liveChecks.forEach((ch, i) => {
+      const icon = ch.status === 'pass' ? '✅' : ch.status === 'fail' ? '❌' : '⚠️';
+      const isApi = ch.name.toLowerCase().includes('http') || ch.name.toLowerCase().includes('get ') || ch.name.toLowerCase().includes('api');
+      const type = isApi ? '`API`' : '`UI`';
       out += `**${i + 1}. ${icon} ${ch.name}** ${type}\n`;
       out += `- **Result:** ${ch.status.toUpperCase()}\n`;
       out += `- **Detail:** ${ch.details || '(no detail)'}\n\n`;
