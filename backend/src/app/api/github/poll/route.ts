@@ -319,12 +319,13 @@ async function processCommit(
   commitMessage: string,
   author: string,
   repo: string,
-  filesChanged: { filename: string; status: string; additions: number; deletions: number; patch?: string }[]
+  filesChanged: { filename: string; status: string; additions: number; deletions: number; patch?: string }[],
+  overrideUrl?: string
 ) {
   const linearUrl = `https://linear.app/creatorfun/issue/${ticketId}`;
   const short = commitSha.slice(0, 7);
   const repoName = repo.split('/')[1];
-  const commitUrl = `https://github.com/${repo}/commit/${commitSha}`;
+  const commitUrl = overrideUrl ?? `https://github.com/${repo}/commit/${commitSha}`;
 
   try {
     // ── Step 1: Find or create Linear ticket ──
@@ -528,6 +529,61 @@ export async function POST(req: NextRequest) {
   const state = await loadState();
   const results: any[] = [];
   let newCommitsFound = 0;
+
+  // ── Poll open PRs across all repos ──
+  for (const repo of REPOS) {
+    try {
+      const prRes = await fetch(`https://api.github.com/repos/${repo}/pulls?state=open&per_page=20`, {
+        headers: { 'Authorization': `Bearer ${GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!prRes.ok) continue;
+      const prs = await prRes.json();
+      if (!Array.isArray(prs)) continue;
+
+      for (const pr of prs) {
+        const headSha = pr.head?.sha;
+        const prKey = `pr:${repo}:${pr.number}`;
+        if (!headSha || state.processedTickets[prKey]) continue;
+
+        const ticketIds = extractTicketIds([pr.title, pr.body || '']);
+        if (ticketIds.length === 0) continue;
+
+        // Mark PR as seen
+        state.processedTickets[prKey] = headSha;
+        await saveState(state);
+
+        // Get changed files from PR
+        let filesChanged: any[] = [];
+        try {
+          const filesRes = await fetch(`https://api.github.com/repos/${repo}/pulls/${pr.number}/files`, {
+            headers: { 'Authorization': `Bearer ${GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' },
+            signal: AbortSignal.timeout(15000),
+          });
+          if (filesRes.ok) {
+            const files = await filesRes.json();
+            filesChanged = (files || []).map((f: any) => ({ filename: f.filename, status: f.status, additions: f.additions || 0, deletions: f.deletions || 0, patch: f.patch || '' }));
+          }
+        } catch { /* non-fatal */ }
+
+        console.log(`[poll] PR #${pr.number} in ${repo}: ${ticketIds.join(', ')}`);
+        newCommitsFound++;
+
+        for (const ticketId of ticketIds) {
+          const result = await processCommit(
+            ticketId, headSha,
+            `PR #${pr.number}: ${pr.title}`,
+            pr.user?.login || 'unknown',
+            repo, filesChanged,
+            `https://github.com/${repo}/pull/${pr.number}`
+          );
+          results.push(result);
+        }
+      }
+    } catch (prErr: any) {
+      console.warn(`[poll] PR scan failed for ${repo}: ${prErr.message}`);
+    }
+  }
 
   for (const repo of REPOS) {
     const lastSha = state.lastSeenShas[repo];
