@@ -100,21 +100,51 @@ async function saveState(state: PollState) {
   await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-// ── Fetch recent commits from GitHub ──
+// ── Fetch recent commits from GitHub (main branch + recent feature branches with CRX refs) ──
 async function fetchNewCommits(repo: string, lastSha: string | undefined) {
-  const url = `https://api.github.com/repos/${repo}/commits?sha=${BRANCH}&per_page=20`;
-  const res = await fetch(url, {
-    headers: { 'Authorization': `Bearer ${GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' },
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!res.ok) return [];
-  const commits = await res.json();
-  if (!Array.isArray(commits)) return [];
-  const result = [];
-  for (const c of commits) {
-    if (c.sha === lastSha) break;
-    result.push({ sha: c.sha as string, message: (c.commit?.message as string) || '', author: (c.commit?.author?.name as string) || '' });
+  const headers = { 'Authorization': `Bearer ${GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' };
+  const seen = new Set<string>();
+  const result: { sha: string; message: string; author: string; branch: string }[] = [];
+
+  // Helper to fetch commits from a specific branch
+  async function fetchFromBranch(branch: string) {
+    const url = `https://api.github.com/repos/${repo}/commits?sha=${branch}&per_page=20`;
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+    if (!res.ok) return;
+    const commits = await res.json();
+    if (!Array.isArray(commits)) return;
+    for (const c of commits) {
+      if (c.sha === lastSha) break;
+      if (seen.has(c.sha)) continue;
+      seen.add(c.sha);
+      const message = (c.commit?.message as string) || '';
+      // Only include commits that reference a CRX ticket
+      if (TICKET_REGEX.test(message)) {
+        result.push({ sha: c.sha, message, author: (c.commit?.author?.name as string) || '', branch });
+      }
+    }
   }
+
+  // Always check the primary branch
+  await fetchFromBranch(BRANCH);
+
+  // Also scan recent feature/fix branches for CRX commits
+  try {
+    const branchesRes = await fetch(`https://api.github.com/repos/${repo}/branches?per_page=50`, { headers, signal: AbortSignal.timeout(10000) });
+    if (branchesRes.ok) {
+      const branches = await branchesRes.json();
+      if (Array.isArray(branches)) {
+        // Filter branches that look like feature/fix branches with CRX refs
+        const featureBranches = branches
+          .filter((b: any) => /^(fix|feat|feature|chore)\/crx-/i.test(b.name) && b.name !== BRANCH)
+          .slice(0, 10); // max 10 feature branches
+        await Promise.all(featureBranches.map((b: any) => fetchFromBranch(b.name)));
+      }
+    }
+  } catch {
+    // non-fatal — feature branch scan is best-effort
+  }
+
   return result;
 }
 
