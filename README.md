@@ -1,92 +1,120 @@
 # 🛡️ QA Shield
 
-**AI-powered QA lifecycle automation for Creator.fun — Solana meme coin trading platform**
+> **AI-powered autonomous QA lifecycle automation** — enriches tickets, verifies fixes, scans security/performance, and responds on your behalf when you're away.
 
-QA Shield automates the entire QA workflow using **Codex AI** (powered by ChatGPT Plus — no extra API credits needed): from ticket enrichment to fix verification, security scanning, and performance benchmarking.
-
----
-
-## AI Workflow Overview
-
-```
-Linear Ticket Created
-        │
-        ▼
-POST /api/enrich  ──► Returns instantly (~3s)
-        │               Codex runs in background (~60-90s)
-        │
-        ▼
-Codex reads codebase + analyzes ticket
-        │
-        ▼
-Deep analysis comment posted to Linear automatically
-        │
-        ▼
-Dev receives: root cause, file locations, test cases, fix approach
-        │
-        ▼
-Dev pushes fix → staging branch
-        │
-        ▼
-POST /api/verify  ──► Codex verifies the fix in background
-        │
-        ▼
-PASS → ticket moved to Done ✅
-FAIL → ticket moved back to Todo with failure details ❌
-```
+Built to work with **Linear** + **GitHub** + **Slack** + **OpenClaw** (optional). Zero manual QA overhead.
 
 ---
 
-## Architecture
+## What It Does
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                      QA Shield Backend                   │
-│                  (Next.js / TypeScript)                  │
-│                                                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
-│  │ /api/enrich  │  │ /api/verify  │  │ /api/guardian│  │
-│  │  (instant)   │  │  (instant)   │  │  (scheduled) │  │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  │
-│         │                 │                  │          │
-│         ▼                 ▼                  ▼          │
-│  ┌─────────────────────────────────────────────────┐   │
-│  │              Codex Background Runner             │   │
-│  │   codex-background.ts + codex-runner-process.mjs│   │
-│  │   • Spawns detached Node.js process              │   │
-│  │   • Codex CLI runs gpt-5.4 reasoning model       │   │
-│  │   • Reads actual codebase for deep analysis      │   │
-│  │   • Posts results to Linear when done            │   │
-│  └─────────────────────────────────────────────────┘   │
-│                                                         │
-│  Fallback chain (if Codex unavailable):                 │
-│  OpenAI API key → Chief QA proxy → Anthropic → Rules   │
-└─────────────────────────────────────────────────────────┘
+Linear Ticket Created / Commit Pushed
+              │
+              ▼
+  ┌─────────────────────────┐
+  │   QA Shield Backend     │
+  │   (Next.js / TypeScript)│
+  └──────────┬──────────────┘
+             │
+    ┌────────┴────────┐
+    │                 │
+    ▼                 ▼
+POST /api/enrich   POST /api/verify
+ (AI analysis)      (fix validation)
+    │                 │
+    ▼                 ▼
+Linear comment    PASS → Done ✅
+with root cause   FAIL → Todo ❌
++ test cases      + failure report
+```
+
+**Core capabilities:**
+- 🤖 **Ticket Enrichment** — AI analyzes Linear tickets: root cause, reproduction steps, test cases, fix approach
+- ✅ **Fix Verification** — reads GitHub diffs, runs real checks, auto-moves tickets to Done or back to Todo
+- 🔍 **Guardian Scanner** — scheduled security + performance audits, auto-files Linear tickets
+- 📊 **Pre-Merge Verification** — watches staging branch commits, verifies fixes before they merge
+- 💬 **Away Responder** — when you're away and someone tags you, the bot responds and handles the task
+
+---
+
+## Quick Start
+
+```bash
+git clone https://github.com/zohaibauthornate/qa-shield.git
+cd qa-shield/backend
+cp .env.example .env.local
+# Fill in your keys (see Environment Variables below)
+npm install
+PORT=3000 npm run dev
 ```
 
 ---
 
-## Key Features
+## Environment Variables
 
-### 🤖 Codex AI Engine (Zero Extra Cost)
-- Powered by **Codex CLI** using ChatGPT Plus subscription
-- Uses **gpt-5.4** reasoning model — reads and understands actual codebase files
-- **Async by design** — API responds in ~3s, analysis posts to Linear in ~60-90s
-- No OpenAI API billing required — runs on your existing ChatGPT Plus plan
-- Fallback chain: OpenAI API → Chief QA proxy → Anthropic → Rule-based
+Copy `.env.example` to `.env.local` and fill in your values:
 
-### 📋 Ticket Enrichment (`POST /api/enrich`)
-Analyzes a Linear ticket and posts a structured AI comment:
-- **Classification** — bug / improvement / feature / hotfix
-- **Root cause analysis** — what broke, which component, technical why
-- **Impact assessment** — severity, affected users, pages, endpoints
-- **Steps to reproduce** — exact steps on dev.creator.fun
-- **Test cases** — must/should/nice priority with clear pass/fail criteria
-- **Edge cases** — tricky scenarios devs might miss
-- **Recommended fix** — approach, files likely involved, effort estimate
-- **Post-fix verification checklist** — what to check after the fix
+```env
+# ── Linear ──────────────────────────────────────────────
+LINEAR_API_KEY=lin_api_xxx            # Your Linear API key
+LINEAR_TEAM_ID=xxx                    # Your Linear team ID
 
-**Response:** Instant (~3s). Comment appears in Linear in ~60-90s.
+# ── GitHub ──────────────────────────────────────────────
+GITHUB_TOKEN=ghp_xxx                  # Personal Access Token (repo read)
+GITHUB_REPOS=org/frontend,org/backend # Comma-separated repos to watch
+GITHUB_BRANCH=staging                 # Branch to watch for commits
+GITHUB_WEBHOOK_SECRET=your-secret     # For webhook signature verification
+
+# ── Your App URLs ────────────────────────────────────────
+STAGING_URL=https://dev.yourapp.com
+STAGING_API_URL=https://api.dev.yourapp.com
+COMPETITOR_URLS=https://competitor1.com,https://competitor2.com
+
+# ── AI Providers (priority order) ───────────────────────
+# Option 1: Codex CLI (free with ChatGPT Plus — see Codex Setup below)
+# Option 2: OpenAI API key
+OPENAI_API_KEY=sk-proj-xxx
+# Option 3: Anthropic
+ANTHROPIC_API_KEY=sk-ant-xxx
+
+# ── Slack (for alerts + away responder) ─────────────────
+SLACK_BOT_TOKEN=xoxb-xxx
+REGRESSION_SLACK_CHANNEL=C0XXXXXXXX   # Channel ID for QA reports
+
+# ── App ──────────────────────────────────────────────────
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+```
+
+---
+
+## AI Engine Options
+
+QA Shield supports multiple AI backends with automatic fallback:
+
+| Engine | Model | Cost | Notes |
+|--------|-------|------|-------|
+| **Codex CLI** | gpt-5.4 | Free (ChatGPT Plus) | Reads codebase, deepest analysis |
+| OpenAI API | gpt-4o | ~$0.01/ticket | Requires API billing |
+| Anthropic | claude-sonnet | Requires API key | Fast fallback |
+| Rule-based | — | Free | Always available |
+
+**Priority:** Codex → OpenAI → Anthropic → Rule-based
+
+### Codex CLI Setup (recommended — zero API cost)
+
+```bash
+npm install -g @openai/codex
+codex login   # Opens browser, uses ChatGPT Plus auth
+# Auth stored at ~/.codex/auth.json
+```
+
+---
+
+## API Reference
+
+### `POST /api/enrich`
+Analyzes a Linear ticket and posts an AI comment with root cause, test cases, and fix approach.
 
 ```bash
 curl -X POST http://localhost:3000/api/enrich \
@@ -94,13 +122,12 @@ curl -X POST http://localhost:3000/api/enrich \
   -d '{"identifier": "CRX-900", "postComment": true}'
 ```
 
-### ✅ Fix Verification (`POST /api/verify`)
-After a dev pushes a fix, QA Shield verifies it actually works:
-- Reads GitHub diff to understand what changed
-- Generates targeted API and DOM checks
-- Executes real checks against `dev.creator.fun`
-- **PASS** → moves ticket to Done + posts verification comment
-- **FAIL** → moves ticket back to Todo + posts failure details with evidence
+Response is instant (~3s). AI comment appears in Linear in ~60-90s.
+
+---
+
+### `POST /api/verify`
+Reads GitHub diff for a ticket's fix, runs real checks against your staging URL, moves ticket to Done or back to Todo.
 
 ```bash
 curl -X POST http://localhost:3000/api/verify \
@@ -108,94 +135,110 @@ curl -X POST http://localhost:3000/api/verify \
   -d '{"identifier": "CRX-900"}'
 ```
 
-### 🔍 Job Status (`GET /api/enrich/status`)
-Track background Codex analysis jobs:
+---
+
+### `GET /api/enrich/status`
+Check status of a background analysis job.
 
 ```bash
-# By ticket identifier
 curl "http://localhost:3000/api/enrich/status?identifier=CRX-900"
-
-# By job ID (returned in enrich response)
-curl "http://localhost:3000/api/enrich/status?jobId=abc123"
 ```
-
-### 🛡️ Guardian Scanner (`POST /api/background/scan`)
-Runs proactive security and performance audits on a schedule:
-- **Security**: CORS, missing auth headers, exposed endpoints, API key leaks
-- **Performance**: Response time benchmarks vs axiom.trade and pump.fun
-- **Auto-filing**: Creates Linear tickets for critical findings
-- **Deduplication**: Checks for existing similar issues before creating
-- **AI Fix Prompts**: Every ticket includes a ready-to-paste Cursor/Claude Code prompt
-
-### 📊 Pre-Merge Verification
-Watches staging branch commits for CRX-XXX references:
-- Detects when a fix is pushed to staging
-- Auto-triggers verification for the associated ticket
-- Nothing reaches Done without passing verify-fix
 
 ---
 
-## Setup
-
-### Prerequisites
-- Node.js 18+
-- Linear API key
-- GitHub PAT (for repo access)
-- **Codex CLI** with ChatGPT Plus OAuth (primary AI engine)
-
-### Codex CLI Setup (One-time)
+### `POST /api/background/scan`
+Run the Guardian scanner manually (also runs on a schedule via cron).
 
 ```bash
-# Install Codex CLI
-npm install -g @openai/codex
-
-# Authenticate with ChatGPT Plus (opens browser)
-codex login
-
-# Auth stored at ~/.codex/auth.json
+curl -X POST http://localhost:3000/api/background/scan
 ```
-
-### Environment Variables
-
-```env
-# Linear
-LINEAR_API_KEY=lin_api_xxx
-
-# GitHub (for commit context)
-GITHUB_TOKEN=ghp_xxx
-
-# Staging URL
-STAGING_URL=https://dev.creator.fun
-
-# Optional fallbacks (Codex is primary — no API key needed)
-OPENAI_API_KEY=sk-proj-xxx     # fallback if Codex unavailable
-ANTHROPIC_API_KEY=sk-ant-xxx   # last resort fallback
-```
-
-### Run
-
-```bash
-cd backend
-npm install
-PORT=3000 npm run dev
-```
-
-### LaunchAgent (always-on, auto-restart)
-A macOS LaunchAgent (`com.qashield.backend`) keeps the backend running on port 3000, auto-restarting on crash or reboot.
 
 ---
 
-## AI Engine Details
+## Always-On Setup (macOS LaunchAgent)
 
-| Engine | Model | Speed | Cost | Notes |
-|--------|-------|-------|------|-------|
-| **Codex CLI** | gpt-5.4 | ~60-90s (async) | Free (ChatGPT Plus) | Reads codebase, deepest analysis |
-| OpenAI API | gpt-4o | ~10-15s | ~$0.01/ticket | Requires API billing |
-| Chief QA Proxy | claude-sonnet | ~15-20s | Free (OpenClaw) | Via queue system |
-| Anthropic API | claude-sonnet | ~15s | Requires API key | Last resort |
-| Rule-based | — | <1s | Free | Fallback, no AI |
+To keep QA Shield running permanently (auto-restart on crash/reboot):
 
-**Priority order:** Codex → OpenAI API → Chief QA Proxy → Anthropic → Rule-based
+```bash
+# Create LaunchAgent plist
+cat > ~/Library/LaunchAgents/com.qashield.backend.plist << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.qashield.backend</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>/path/to/qa-shield/backend/node_modules/.bin/next</string>
+        <string>start</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/qa-shield/backend</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PORT</key>
+        <string>3000</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/qa-shield.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/qa-shield-error.log</string>
+</dict>
+</plist>
+EOF
+
+launchctl load ~/Library/LaunchAgents/com.qashield.backend.plist
+```
+
+---
+
+## OpenClaw Integration (Away Responder)
+
+QA Shield pairs with **[OpenClaw](https://openclaw.ai)** to create a fully autonomous QA agent:
+
+- When you're **away on Slack** and someone tags you → Chief QA responds on your behalf
+- Incoming QA tasks (verify tickets, investigate bugs) are handled autonomously
+- Guardian scan results and alerts post directly to your Slack channels
+- Pre-merge verification runs automatically on every staging commit
+
+### How it works
+
+1. OpenClaw runs as your persistent AI agent (Chief QA persona)
+2. QA Shield backend handles the heavy lifting (Linear mutations, GitHub diffs, real browser checks)
+3. Chief QA calls QA Shield APIs and reports results back to Slack
+
+```
+Slack @mention (you're away)
+        │
+        ▼
+OpenClaw (Chief QA) detects message
+        │
+        ├── QA task? → POST /api/verify or /api/enrich
+        ├── Bug report? → POST /api/background/scan
+        └── General question? → Responds with context
+```
+
+See [OpenClaw docs](https://docs.openclaw.ai) for agent setup.
+
+---
+
+## Scheduled Jobs (Cron)
+
+Set up two cron jobs via OpenClaw or system cron:
+
+```bash
+# Guardian scan — 2x per day (9 AM and 5 PM)
+0 9,17 * * * curl -X POST http://localhost:3000/api/background/scan
+
+# Daily QA summary report — 9 AM
+0 9 * * * curl -X POST http://localhost:3000/api/regression
+```
 
 ---
 
@@ -206,58 +249,60 @@ qa-shield/
 ├── backend/
 │   ├── src/
 │   │   ├── app/api/
-│   │   │   ├── enrich/
-│   │   │   │   ├── route.ts          # POST /api/enrich (instant response)
-│   │   │   │   └── status/
-│   │   │   │       └── route.ts      # GET /api/enrich/status
-│   │   │   ├── verify/
-│   │   │   │   ├── route.ts          # POST /api/verify
-│   │   │   │   └── bulk/route.ts     # POST /api/verify/bulk
-│   │   │   ├── background/
-│   │   │   │   └── route.ts          # POST /api/background/scan (guardian)
-│   │   │   ├── ai/
-│   │   │   │   └── queue/route.ts    # AI task queue (Chief QA proxy)
-│   │   │   └── github/route.ts       # GitHub webhook handler
+│   │   │   ├── enrich/          # Ticket AI analysis
+│   │   │   ├── verify/          # Fix verification
+│   │   │   ├── background/      # Guardian scanner
+│   │   │   ├── regression/      # Daily regression report
+│   │   │   ├── security/        # Security audit
+│   │   │   ├── monitor/         # Health monitoring
+│   │   │   ├── ai/queue/        # AI task queue (proxy)
+│   │   │   └── github/          # Webhook handler
 │   │   └── lib/
-│   │       ├── ai.ts                 # Prompt builders + formatters
-│   │       ├── codex-ai.ts           # Codex CLI subprocess wrapper
-│   │       ├── codex-background.ts   # Async job spawner + tracker
-│   │       ├── codex-runner-process.mjs  # Detached background runner
-│   │       ├── which-util.ts         # Cross-platform which()
-│   │       ├── linear.ts             # Linear GraphQL client
-│   │       ├── github.ts             # GitHub commit context fetcher
-│   │       ├── scanner.ts            # Security + performance scanner
-│   │       ├── guardian.ts           # Scheduled audit engine
-│   │       ├── verifier.ts           # DOM + API verifier
-│   │       ├── verify-runner.ts      # Verification orchestrator
-│   │       └── commit-runner.ts      # Pre-merge commit watcher
-└── extension/                        # Chrome extension (QA toolbar)
+│   │       ├── ai.ts            # Prompt builders
+│   │       ├── codex-ai.ts      # Codex CLI wrapper
+│   │       ├── codex-background.ts  # Async job spawner
+│   │       ├── linear.ts        # Linear GraphQL client
+│   │       ├── github.ts        # GitHub commit fetcher
+│   │       ├── scanner.ts       # Security + perf scanner
+│   │       ├── guardian.ts      # Scheduled audit engine
+│   │       ├── verifier.ts      # DOM + API verifier
+│   │       └── verify-runner.ts # Verification orchestrator
+│   └── .env.example
+├── browser-worker/              # Playwright browser automation
+├── extension/                   # Chrome extension (QA toolbar)
+└── reports/                     # Generated QA reports
 ```
 
 ---
 
-## Linear Workflow States
+## Linear Workflow
 
-| State | ID |
-|-------|----|
-| Done | `1d39a7b1-213c-4323-9eed-788c27bc588a` |
-| In Review | `8aa91362-4b1c-407f-9314-9e7d80b1d651` |
-| Todo | *(default)* |
+QA Shield manages your entire Linear ticket lifecycle:
 
-**QA-ReCheck label:** `c7199040-3fb2-441a-bda1-07012e5d67a4`
-
----
-
-## Escalation Rules
-
-| Condition | Action |
-|-----------|--------|
-| Critical bug found | Post to Slack #dev immediately |
-| Ticket stale 3+ days | Flag in bugs channel, tag assigned dev |
-| Ticket stale 5+ days | Escalate to Haider |
-| Ticket stale 7+ days | Escalate to George |
+```
+Todo → In Progress → In Review (QA-ReCheck) → Done
+                           ↑
+                    QA Shield picks up here:
+                    reads code diff → runs checks
+                    PASS → Done | FAIL → back to Todo
+```
 
 ---
 
-## Built by Chief QA 🛡️
-Automated QA infrastructure for Creator.fun — keeping the platform stable so devs can ship fast.
+## Requirements
+
+- Node.js 18+
+- Linear account + API key
+- GitHub account + PAT (repo read access)
+- Slack bot token (for alerts)
+- One of: ChatGPT Plus (Codex), OpenAI API key, or Anthropic API key
+
+---
+
+## License
+
+MIT — use it, fork it, build on it.
+
+---
+
+*Built with 🛡️ by [Chief QA](https://openclaw.ai) — autonomous QA watchdog for Web3 platforms*
